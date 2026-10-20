@@ -2209,11 +2209,9 @@ void interruption_signal_handler(int signal_number) {
         logger << log4cpp::Priority::INFO << "Stop rustbgpd action";
 
         if (!rustbgpd_action_signal_shutdown()) {
-            // Its worker still runs and exit() would destroy objects it uses. Only async-signal-safe calls here
-            const char notice[] = "rustbgpd action did not stop in time, exiting without cleanup\n";
-            ssize_t written     = write(STDERR_FILENO, notice, sizeof(notice) - 1);
-            (void)written;
-            _exit(1);
+            // Its worker still runs and exit() would destroy objects it uses. We leave at once with status 2.
+            // No message: even write() may block here when stderr is a full pipe
+            _exit(2);
         }
     }
 #endif

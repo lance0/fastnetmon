@@ -455,7 +455,9 @@ TEST_F(RustbgpdActionTest, exit_without_shutdown_is_clean) {
 
 std::atomic<pid_t> worker_thread_id{ 0 };
 
-// Same steps as FastNetMon's interruption_signal_handler for this action. Exit code 3 if it ran on worker thread
+// Final steps of FastNetMon's interruption_signal_handler, the ones about this action. Steps which the real handler
+// runs before them (logging, API server shutdown, joins of thread groups) are not covered by these tests. Exit code
+// 3 if it ran on worker thread
 void production_signal_handler(int signal_number) {
 #ifdef __linux__
     bool on_worker = syscall(SYS_gettid) == worker_thread_id;
@@ -464,10 +466,7 @@ void production_signal_handler(int signal_number) {
 #endif
 
     if (!rustbgpd_action_signal_shutdown()) {
-        const char notice[] = "rustbgpd action did not stop in time, exiting without cleanup\n";
-        ssize_t written     = write(STDERR_FILENO, notice, sizeof(notice) - 1);
-        (void)written;
-        _exit(1);
+        _exit(2);
     }
 
     exit(on_worker ? 3 : 0);
@@ -587,7 +586,7 @@ TEST_F(RustbgpdActionTest, signal_is_never_handled_on_worker_thread) {
 #endif
 
 // Signal handler runs on thread which holds action's lock: shutdown from handler must not lock it again. Worker may
-// stop in time (exit 0) or wait for that lock (exit 1 without cleanup), both are fine. Hang or crash are not
+// stop in time (exit 0) or wait for that lock (exit 2 without cleanup), both are fine. Hang or crash are not
 TEST_F(RustbgpdActionTest, signal_while_lock_is_held_does_not_deadlock) {
     EXPECT_EXIT(
         {
@@ -604,7 +603,7 @@ TEST_F(RustbgpdActionTest, signal_while_lock_is_held_does_not_deadlock) {
             std::this_thread::sleep_for(30s);
             exit(5);
         },
-        [](int status) { return WIFEXITED(status) && (WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 1); }, "");
+        [](int status) { return WIFEXITED(status) && (WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 2); }, "");
 }
 
 // Worker does not stop within the bound: handler must leave without destroying objects worker still uses. With
@@ -631,7 +630,50 @@ TEST_F(RustbgpdActionTest, worker_held_past_stop_timeout_exits_without_teardown)
             std::this_thread::sleep_for(30s);
             exit(5);
         },
-        ::testing::ExitedWithCode(1), "rustbgpd action did not stop in time");
+        ::testing::ExitedWithCode(2), "");
+}
+
+// Same as above with stderr going to a full pipe nobody reads: handler must still leave within its bound, so it
+// must not write anything
+TEST_F(RustbgpdActionTest, worker_held_past_stop_timeout_exits_with_blocked_stderr) {
+    EXPECT_EXIT(
+        {
+            alarm(20);
+            signal(SIGINT, production_signal_handler);
+
+            int stderr_pipe[2];
+
+            if (pipe(stderr_pipe) != 0) {
+                exit(4);
+            }
+
+            // Fill the pipe, then make writes to it block
+            fcntl(stderr_pipe[1], F_SETFL, O_NONBLOCK);
+            char filler[4096] = {};
+
+            while (write(stderr_pipe[1], filler, sizeof(filler)) > 0) {
+            }
+
+            fcntl(stderr_pipe[1], F_SETFL, 0);
+            dup2(stderr_pipe[1], STDERR_FILENO);
+
+            if (!rustbgpd_action_init()) {
+                exit(4);
+            }
+
+            rustbgpd_test_checkpoint   = test_checkpoint;
+            hold_worker_after_announce = true;
+            ipv4_action("ban", "203.0.113.7");
+
+            if (!wait_for([&] { return worker_held.load(); }, 3s)) {
+                exit(4);
+            }
+
+            raise(SIGINT);
+            std::this_thread::sleep_for(30s);
+            exit(5);
+        },
+        ::testing::ExitedWithCode(2), "");
 }
 
 // Subnet announce stays while any banned host of that subnet needs it

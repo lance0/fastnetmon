@@ -15,7 +15,8 @@ void rustbgpd_action_shutdown();
 
 // Stops worker from signal handler: only async-signal-safe operations, never locks or joins. Waits up to 6 seconds
 // for worker to finish. Returns false if it is still running: then caller must leave with _exit(), as exit() would
-// destroy objects worker uses. rustbgpd_action_shutdown does nothing after it
+// destroy objects worker uses. rustbgpd_action_shutdown does nothing after it. This covers only this action: code
+// which runs in signal handler before it must be async-signal-safe on its own
 bool rustbgpd_action_signal_shutdown();
 
 // Test hook called by action at named points, never set in FastNetMon
