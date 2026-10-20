@@ -126,13 +126,13 @@ Change `match_community` too if you use another community.
 - With `rustbgpd_announce_whole_subnet = on`, the subnet route stays announced while any banned host from that subnet needs it, and is withdrawn after the last one is unbanned.
 - Each call is checked. The log shows the outcome rustbgpd returns: `PATH_INJECT_OUTCOME_CREATED`, `REPLACED` or `UNCHANGED` for an announce, `PATH_DELETE_OUTCOME_DELETED` or `NOT_PRESENT` for a withdrawal, or the gRPC error with its status name. An answer without one of these outcomes (rustbgpd older than 0.79.0, for example) counts as a failure.
 - Withdrawals set `allow_missing`, so withdrawing a route rustbgpd no longer has succeeds.
-- A call rustbgpd rejects is retried after `rustbgpd_reconcile_interval` seconds, but at most 10 seconds later. A call that failed because rustbgpd was unreachable is retried as soon as rustbgpd answers again.
+- A call rustbgpd rejects is retried after `rustbgpd_reconcile_interval` seconds, but at most 10 seconds later. A call that fails because rustbgpd is unreachable is retried after 0.5, 1, 2, 4 and 8 seconds, then every 10 seconds (and never later than `rustbgpd_reconcile_interval`), and at once when rustbgpd answers again after a failed liveness probe. A result for a ban state that changed while the call was in progress is ignored, so the newer state is sent without delay.
 - rustbgpd keeps injected routes in memory only. The action announces all wanted routes again:
   - as soon as rustbgpd answers after its liveness probe failed, for example after a rustbgpd restart (the action probes every 0.5 seconds and logs the status of a failed probe);
   - when rustbgpd starts a new lease generation, if leases are on;
   - every `rustbgpd_reconcile_interval` seconds.
 - On a planned rustbgpd restart, BGP peers with Graceful Restart keep the blackholes as stale routes. rustbgpd sends End-of-RIB soon after the session comes back, and the action announces the bans again shortly after rustbgpd's API answers. A short gap between the two is possible, so a peer may drop a blackhole for a moment. A restart faster than one probe interval is caught by the periodic pass instead.
-- FastNetMon stops the worker on shutdown and cancels a call in flight.
+- On SIGINT, FastNetMon's signal handler asks the worker to stop and waits up to the call deadline (5 seconds) for it to finish its current call; it does not lock or join anything in the handler. The worker thread, named `rustbgpd`, blocks all signals, so the handler never runs on it.
 - Ban lists are not persistent in FastNetMon either. If FastNetMon stops, its bans stay in rustbgpd until they are withdrawn by hand (`rbgp rib delete <prefix>`) or until rustbgpd restarts, unless leases are on.
 
 ## Leases (experimental)
