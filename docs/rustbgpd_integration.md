@@ -8,7 +8,7 @@ It was tested with rustbgpd 0.79.0. Earlier rustbgpd releases reject the `0.0.0.
 
 ## Build
 
-The action is built when gRPC support is built (`ENABLE_GOBGP_SUPPORT`, on by default). To leave it out, configure with `-DENABLE_RUSTBGPD_SUPPORT=OFF`.
+The action is built when gRPC support is built (`ENABLE_GOBGP_SUPPORT`, on by default), except on Windows: it uses POSIX signal and file APIs, so Windows builds leave it out and keep the GoBGP action. To leave it out elsewhere, configure with `-DENABLE_RUSTBGPD_SUPPORT=OFF`.
 
 With `-DBUILD_TESTS=ON` the build also produces `rustbgpd_action_tests`, which runs the action against a mock of rustbgpd's gRPC API.
 
@@ -132,7 +132,7 @@ Change `match_community` too if you use another community.
   - when rustbgpd starts a new lease generation, if leases are on;
   - every `rustbgpd_reconcile_interval` seconds.
 - On a planned rustbgpd restart, BGP peers with Graceful Restart keep the blackholes as stale routes. rustbgpd sends End-of-RIB soon after the session comes back, and the action announces the bans again shortly after rustbgpd's API answers. A short gap between the two is possible, so a peer may drop a blackhole for a moment. A restart faster than one probe interval is caught by the periodic pass instead.
-- On SIGINT, FastNetMon's signal handler asks the worker to stop and waits up to 6 seconds (the 5 second call deadline plus one second) for it to finish its current call; it does not lock or join anything in the handler. If the worker has not finished by then, FastNetMon prints `rustbgpd action did not stop in time, exiting without cleanup` to standard error and exits at once with status 1, without running exit handlers. The worker thread, named `rustbgpd` where the platform supports thread names, blocks SIGINT, so the handler never runs on it.
+- On SIGINT, after its own shutdown steps, FastNetMon's signal handler asks the worker to stop and waits up to 6 seconds (the 5 second call deadline plus one second) for it to finish its current call. This part of the handler does not lock, join or write anything. If the worker has finished, FastNetMon exits as usual with status 1. If it has not, FastNetMon exits at once with status 2, without running exit handlers or destructors, which the worker might still use. The worker thread, named `rustbgpd` where the platform supports thread names, blocks SIGINT, so the handler never runs on it; gRPC threads created for its channel block SIGINT too, but gRPC threads that existed before may still receive it. These guarantees cover the rustbgpd steps only. Before them FastNetMon's handler logs, stops its API server and joins its own threads, which is not async-signal-safe and is outside this action.
 - Ban lists are not persistent in FastNetMon either. If FastNetMon stops, its bans stay in rustbgpd until they are withdrawn by hand (`rbgp rib delete <prefix>`) or until rustbgpd restarts, unless leases are on.
 
 ## Leases (experimental)
