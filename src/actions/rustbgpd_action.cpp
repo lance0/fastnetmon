@@ -80,6 +80,9 @@ class rustbgpd_route_state_t {
 
     // Do not retry failed call before this time
     rustbgpd_clock_t::time_point retry_after{};
+
+    // Failed calls in a row for current version
+    unsigned int failures = 0;
 };
 
 // Copy of route state which worker uses for gRPC call without holding lock
@@ -378,20 +381,28 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
     }
 
     if (result != rustbgpd_call_result_t::success) {
-        // Unreachable rustbgpd: retry on next successful probe. Rejected call or answer we do not understand: retry
-        // after rustbgpd_reconcile_interval but not later than in 10 seconds, operator may fix cause in meantime
-        auto retry_delay = std::min(std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval),
-                                    std::chrono::seconds(10));
+        // Rejected call or answer we do not understand: retry after rustbgpd_reconcile_interval but not later than
+        // in 10 seconds, operator may fix cause in meantime. Call which failed as unreachable while liveness probes
+        // succeed: retry after 0.5, 1, 2, 4... seconds up to the same limit. When rustbgpd comes back after failed
+        // probe, full pass retries everything at once
+        auto max_delay = std::min(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval)),
+                                  std::chrono::milliseconds(10000));
 
-        state.retry_after = rustbgpd_clock_t::now();
+        state.failures++;
 
-        if (result == rustbgpd_call_result_t::failure) {
-            state.retry_after += retry_delay;
+        auto delay = max_delay;
+
+        if (result == rustbgpd_call_result_t::transient_failure) {
+            delay = std::min(std::chrono::milliseconds(500) * (1u << std::min(state.failures - 1, 5u)), max_delay);
         }
+
+        state.retry_after = rustbgpd_clock_t::now() + delay;
         return;
     }
 
     state.synced_version = job.version;
+    state.failures       = 0;
 
     if (state.contributors.empty()) {
         rustbgpd_routes.erase(it);
@@ -1000,6 +1011,7 @@ void rustbgpd_ban_manage(const std::string& action,
             state.route       = route;
             state.version     = ++rustbgpd_last_version;
             state.retry_after = rustbgpd_clock_t::time_point{};
+            state.failures    = 0;
         }
 
         logger << log4cpp::Priority::INFO << "rustbgpd " << (wanted_now ? "announce" : "withdrawal") << " of "

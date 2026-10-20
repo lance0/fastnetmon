@@ -100,6 +100,9 @@ class mock_state_t {
     // Announces wait while it is set
     std::atomic<bool> hold_adds{ false };
 
+    // Status for announces, OK means normal answer
+    std::atomic<int> add_status_code{ grpc::StatusCode::OK };
+
     // Answer next announce without outcome
     std::atomic<bool> omit_next_add_outcome{ false };
 
@@ -138,6 +141,11 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
     grpc::Status AddPath(grpc::ServerContext* context,
                          const rustbgpd::v1::AddPathRequest* request,
                          rustbgpd::v1::AddPathResponse* response) override {
+        if (state.add_status_code != grpc::StatusCode::OK) {
+            state.adds_started++;
+            return grpc::Status(grpc::StatusCode(state.add_status_code.load()), "mock announce failure");
+        }
+
         auto outcome = add(context, *request, "");
         set_outcome(response, outcome);
         return grpc::Status::OK;
@@ -397,6 +405,22 @@ TEST_F(RustbgpdActionTest, failed_outdated_announce_does_not_delay_withdrawal) {
 
     EXPECT_TRUE(wait_for([&] { return state.deletes >= 1 && !state.has("203.0.113.7/32"); }, 2s))
         << "withdrawal waited for retry delay of outdated announce";
+}
+
+// Announce fails as unavailable while liveness probes succeed: retries back off instead of running every probe
+TEST_F(RustbgpdActionTest, unavailable_announce_backs_off) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    state.add_status_code = grpc::StatusCode::UNAVAILABLE;
+    ipv4_action("ban", "203.0.113.7");
+    std::this_thread::sleep_for(6s);
+
+    // 0.5 s probe interval alone gives about 12 attempts in 6 s, backoff 0.5, 1, 2, 4 s gives 5 at most
+    EXPECT_GE(state.adds_started, 3) << "announce was not retried";
+    EXPECT_LE(state.adds_started, 6) << "announce retried without backoff";
+
+    state.add_status_code = grpc::StatusCode::OK;
+    EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 10s));
 }
 
 // Shutdown cancels call in flight, joins worker and no calls happen after it
