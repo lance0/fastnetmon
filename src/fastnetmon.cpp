@@ -64,6 +64,10 @@
 #include "actions/gobgp_action.hpp"
 #endif
 
+#ifdef ENABLE_RUSTBGPD
+#include "actions/rustbgpd_action.hpp"
+#endif
+
 #include "bgp_protocol_flow_spec.hpp"
 
 // Yes, maybe it's not an good idea but with this we can guarantee working code in example plugin
@@ -697,6 +701,13 @@ bool load_configuration_file() {
     // GoBGP configuration
     if (configuration_map.count("gobgp") != 0) {
         fastnetmon_global_configuration.gobgp = configuration_map["gobgp"] == "on";
+    }
+#endif
+
+#ifdef ENABLE_RUSTBGPD
+    // rustbgpd configuration
+    if (configuration_map.count("rustbgpd") != 0) {
+        fastnetmon_global_configuration.rustbgpd = configuration_map["rustbgpd"] == "on";
     }
 #endif
 
@@ -1996,6 +2007,15 @@ int main(int argc, char** argv) {
 #ifdef ENABLE_GOBGP
     if (fastnetmon_global_configuration.gobgp) {
         gobgp_action_init();
+    }
+#endif
+
+#ifdef ENABLE_RUSTBGPD
+    if (fastnetmon_global_configuration.rustbgpd) {
+        if (!rustbgpd_action_init()) {
+            logger << log4cpp::Priority::ERROR << "rustbgpd action is disabled because of configuration errors";
+            fastnetmon_global_configuration.rustbgpd = false;
+        }
     }
 #endif
 

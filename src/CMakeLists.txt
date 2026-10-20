@@ -69,6 +69,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++20")
 # With this flag we can enable GoBGP build via console: cmake .. -DENABLE_GOBGP_SUPPORT=ON
 option(ENABLE_GOBGP_SUPPORT "Enable GoBGP support build" ON)
 
+# rustbgpd action uses gRPC and Protobuf which we look up for GoBGP support. It requires ENABLE_GOBGP_SUPPORT
+option(ENABLE_RUSTBGPD_SUPPORT "Enable rustbgpd support build" ON)
+
 # It can be disabled this way: cmake .. -DENABLE_PCAP_SUPPORT=OFF
 option(ENABLE_PCAP_SUPPORT "Enable PCAP support" ON)
 
@@ -784,6 +787,42 @@ if (ENABLE_GOBGP_SUPPORT)
 
     target_link_libraries(gobgp_action attribute_pb_cc)
 
+    if (ENABLE_RUSTBGPD_SUPPORT)
+        add_definitions(-DENABLE_RUSTBGPD)
+
+        message(STATUS "Building rustbgpd gRPC mappings for C++")
+
+        execute_process(COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/rustbgpd_client --grpc_out=${PROJECT_SOURCE_DIR}/rustbgpd_client --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN} ${PROJECT_SOURCE_DIR}/rustbgpd_client/rustbgpd_injection.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+        message(STATUS "Protoc return code for rustbgpd_injection.proto gRPC: ${PROTOC_RETURN_CODE} std err: ${PROTOC_STDERR}")
+
+        execute_process(COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/rustbgpd_client --cpp_out=${PROJECT_SOURCE_DIR}/rustbgpd_client ${PROJECT_SOURCE_DIR}/rustbgpd_client/rustbgpd_injection.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+        message(STATUS "Protoc return code for rustbgpd_injection.proto Protobuf: ${PROTOC_RETURN_CODE} std err: ${PROTOC_STDERR}")
+
+        add_library(rustbgpd_client_pb_cc STATIC rustbgpd_client/rustbgpd_injection.pb.cc)
+        add_library(rustbgpd_client_grpc_pb_cc STATIC rustbgpd_client/rustbgpd_injection.grpc.pb.cc)
+
+        target_link_libraries(rustbgpd_client_pb_cc protobuf::libprotobuf)
+
+        add_library(rustbgpd_action STATIC actions/rustbgpd_action.cpp)
+
+        if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+            target_link_libraries(rustbgpd_client_grpc_pb_cc gRPC::grpc gRPC::grpc++)
+            target_link_libraries(rustbgpd_action gRPC::grpc gRPC::grpc++)
+        else()
+            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GRPC_PATH})
+            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GPR_PATH})
+            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GRPC_CPP_PATH})
+        endif()
+
+        if (LINK_WITH_ABSL)
+            target_link_libraries(rustbgpd_action absl::base absl::synchronization)
+        endif()
+
+        target_link_libraries(rustbgpd_action rustbgpd_client_pb_cc rustbgpd_client_grpc_pb_cc protobuf::libprotobuf)
+    endif()
+
     # FastNetMon API
     add_definitions(-DFASTNETMON_API)    
 
@@ -1044,6 +1083,10 @@ target_link_libraries(fastnetmon ${OPENSSL_CRYPTO_LIBRARY_PATH})
 
 if (ENABLE_GOBGP_SUPPORT)
     target_link_libraries(fastnetmon gobgp_action)
+endif()
+
+if (ENABLE_GOBGP_SUPPORT AND ENABLE_RUSTBGPD_SUPPORT)
+    target_link_libraries(fastnetmon rustbgpd_action)
 endif()
 
 target_link_libraries(fastnetmon exabgp_action)
