@@ -20,7 +20,6 @@
 #include <map>
 #include <mutex>
 #include <set>
-#include <thread>
 
 #include <grpcpp/grpcpp.h>
 
@@ -113,9 +112,9 @@ bool rustbgpd_lease_generation_known = false;
 rustbgpd::v1::LeaseGeneration rustbgpd_lease_generation;
 
 // Allocated on start and deleted after join. After stop from signal handler we never join and leave it allocated
-std::thread* rustbgpd_worker = nullptr;
-bool rustbgpd_worker_running = false;
-bool rustbgpd_worker_stop    = false;
+boost::thread* rustbgpd_worker = nullptr;
+bool rustbgpd_worker_running   = false;
+bool rustbgpd_worker_stop      = false;
 
 // Stop requested from signal handler. Lock free, signal handler may only touch these two
 std::atomic<bool> rustbgpd_signal_stop{ false };
@@ -424,8 +423,6 @@ void rustbgpd_worker_thread() {
             rustbgpd_worker_exited = true;
         }
     } exit_flag;
-
-    pthread_setname_np(pthread_self(), "rustbgpd");
 
     bool reachable                    = true;
     grpc::StatusCode last_probe_error = grpc::StatusCode::OK;
@@ -924,7 +921,8 @@ bool rustbgpd_action_init() {
         rustbgpd_worker_running = true;
         rustbgpd_worker_exited  = false;
 
-        rustbgpd_worker = new std::thread(rustbgpd_worker_thread);
+        rustbgpd_worker = new boost::thread(rustbgpd_worker_thread);
+        set_boost_process_name(rustbgpd_worker, "rustbgpd");
     }
 
     pthread_sigmask(SIG_SETMASK, &previous_signals, nullptr);

@@ -72,6 +72,11 @@ option(ENABLE_GOBGP_SUPPORT "Enable GoBGP support build" ON)
 # rustbgpd action uses gRPC and Protobuf which we look up for GoBGP support. It requires ENABLE_GOBGP_SUPPORT
 option(ENABLE_RUSTBGPD_SUPPORT "Enable rustbgpd support build" ON)
 
+# rustbgpd action uses POSIX signal and file APIs
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+    set(ENABLE_RUSTBGPD_SUPPORT OFF)
+endif()
+
 # It can be disabled this way: cmake .. -DENABLE_PCAP_SUPPORT=OFF
 option(ENABLE_PCAP_SUPPORT "Enable PCAP support" ON)
 

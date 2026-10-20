@@ -8,8 +8,12 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -453,7 +457,11 @@ std::atomic<pid_t> worker_thread_id{ 0 };
 
 // Same steps as FastNetMon's interruption_signal_handler for this action. Exit code 3 if it ran on worker thread
 void production_signal_handler(int signal_number) {
+#ifdef __linux__
     bool on_worker = syscall(SYS_gettid) == worker_thread_id;
+#else
+    bool on_worker = false;
+#endif
 
     if (!rustbgpd_action_signal_shutdown()) {
         const char notice[] = "rustbgpd action did not stop in time, exiting without cleanup\n";
