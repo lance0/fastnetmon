@@ -70,11 +70,17 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++20")
 option(ENABLE_GOBGP_SUPPORT "Enable GoBGP support build" ON)
 
 # rustbgpd action uses gRPC and Protobuf which we look up for GoBGP support. It requires ENABLE_GOBGP_SUPPORT
-option(ENABLE_RUSTBGPD_SUPPORT "Enable rustbgpd support build" ON)
+# Enable it this way: cmake .. -DENABLE_RUSTBGPD_SUPPORT=ON
+option(ENABLE_RUSTBGPD_SUPPORT "Enable rustbgpd support build" OFF)
 
 # rustbgpd action uses POSIX signal and file APIs
-if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+if (ENABLE_RUSTBGPD_SUPPORT AND ${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+    message(STATUS "rustbgpd action is not supported on Windows, disabling it")
     set(ENABLE_RUSTBGPD_SUPPORT OFF)
+endif()
+
+if (ENABLE_RUSTBGPD_SUPPORT AND NOT ENABLE_GOBGP_SUPPORT)
+    message(STATUS "rustbgpd action requires ENABLE_GOBGP_SUPPORT for gRPC and Protobuf, it will not be built")
 endif()
 
 # It can be disabled this way: cmake .. -DENABLE_PCAP_SUPPORT=OFF
@@ -812,13 +818,8 @@ if (ENABLE_GOBGP_SUPPORT)
 
         add_library(rustbgpd_action STATIC actions/rustbgpd_action.cpp)
 
-        if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
-            target_link_libraries(rustbgpd_client_grpc_pb_cc gRPC::grpc gRPC::grpc++)
-            target_link_libraries(rustbgpd_action gRPC::grpc gRPC::grpc++)
-        else()
-            target_link_libraries(rustbgpd_client_grpc_pb_cc ${GRPC_LIBRARY_GRPC_CPP_PATH} ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH})
-            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GRPC_CPP_PATH} ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH})
-        endif()
+        target_link_libraries(rustbgpd_client_grpc_pb_cc ${GRPC_LIBRARY_GRPC_CPP_PATH} ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH})
+        target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GRPC_CPP_PATH} ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH})
 
         if (LINK_WITH_ABSL)
             target_link_libraries(rustbgpd_client_grpc_pb_cc absl::base absl::synchronization)
