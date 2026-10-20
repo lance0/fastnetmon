@@ -1321,12 +1321,8 @@ void call_blackhole_actions_per_host(attack_action_t attack_action,
 
 #ifdef ENABLE_RUSTBGPD
     if (fastnetmon_global_configuration.rustbgpd) {
-        logger << log4cpp::Priority::INFO << "Call rustbgpd for " << action_name << " client started: " << client_ip_as_string;
-
-        boost::thread rustbgpd_thread(rustbgpd_ban_manage, action_name, ipv6, client_ip, client_ipv6, current_attack);
-        rustbgpd_thread.detach();
-
-        logger << log4cpp::Priority::INFO << "Call to rustbgpd for " << action_name << " client is finished: " << client_ip_as_string;
+        // It does not block on network and must run in order of ban and unban calls, so we do not use thread here
+        rustbgpd_ban_manage(action_name, ipv6, client_ip, client_ipv6, current_attack);
     }
 #endif
 

@@ -2203,6 +2203,13 @@ void interruption_signal_handler(int signal_number) {
     logger << log4cpp::Priority::INFO << "Wait while they finished";
     packet_capture_plugin_thread_group.join_all();
 
+#ifdef ENABLE_RUSTBGPD
+    if (fastnetmon_global_configuration.rustbgpd) {
+        logger << log4cpp::Priority::INFO << "Stop rustbgpd action";
+        rustbgpd_action_shutdown();
+    }
+#endif
+
     logger << log4cpp::Priority::INFO << "Shutdown main process";
 
     // TODO: we should REMOVE this exit command and wait for correct toolkit shutdown

@@ -4,9 +4,12 @@
 #include <arpa/inet.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include <grpcpp/grpcpp.h>
@@ -24,15 +27,22 @@ extern fastnetmon_configuration_t fastnetmon_global_configuration;
 // rustbgpd action: announces and withdraws blackholes through rustbgpd's InjectionService
 // https://github.com/lance0/rustbgpd/blob/main/docs/reference/api.md#injectionservice
 //
-// Routes injected into rustbgpd live only as long as the rustbgpd process. We keep every
-// active ban here and announce all of them again when rustbgpd becomes reachable after a
-// failed liveness probe (as after a rustbgpd restart) and on a periodic reconcile pass.
+// Ban and unban only change desired state here, synchronously and in the order FastNetMon calls them.
+// Single worker thread makes all gRPC calls and moves rustbgpd towards desired state. Each change of desired
+// state for prefix gets new version and worker marks prefix as done only when rustbgpd confirmed exactly that
+// version, so late answer for older state never hides newer one.
+//
+// Routes injected into rustbgpd live only as long as the rustbgpd process. Worker announces all wanted routes
+// again when rustbgpd becomes reachable after failed liveness probe (as after rustbgpd restart), when our lease
+// generation changes and on periodic pass.
 
 // Deadline for AddPath, DeletePath and RenewLease calls
 unsigned int rustbgpd_call_timeout = 5;
 
 // How often we probe rustbgpd with ControlService.CheckLiveness
 const std::chrono::milliseconds rustbgpd_probe_interval(500);
+
+using rustbgpd_clock_t = std::chrono::steady_clock;
 
 class rustbgpd_route_t {
     public:
@@ -46,26 +56,57 @@ class rustbgpd_route_t {
     }
 };
 
+class rustbgpd_route_state_t {
+    public:
+    rustbgpd_route_t route;
+
+    // Banned hosts which need this route. Host route has only host itself, subnet route has all banned hosts from
+    // this subnet. Route must be announced while this set is not empty
+    std::set<std::string> contributors;
+
+    // Version of desired state and last version which rustbgpd confirmed
+    uint64_t version        = 0;
+    uint64_t synced_version = 0;
+
+    // Do not retry failed call before this time
+    rustbgpd_clock_t::time_point retry_after{};
+};
+
+// Copy of route state which worker uses for gRPC call without holding lock
+class rustbgpd_job_t {
+    public:
+    rustbgpd_route_t route;
+    bool announce    = false;
+    uint64_t version = 0;
+};
+
+enum class rustbgpd_call_result_t { success, transient_failure, failure };
+
 std::unique_ptr<rustbgpd::v1::InjectionService::Stub> rustbgpd_injection_stub;
 std::unique_ptr<rustbgpd::v1::ControlService::Stub> rustbgpd_control_stub;
 
 std::string rustbgpd_token;
 
-// Serialises all calls which change routes in rustbgpd with changes of our own ban lists
+// Protects all variables below. Never held during gRPC calls
 std::mutex rustbgpd_mutex;
+std::condition_variable rustbgpd_worker_wakeup;
 
-// Bans which must be announced
-std::map<std::string, rustbgpd_route_t> rustbgpd_active_routes;
-
-// Withdrawals which have not succeeded yet
-std::map<std::string, rustbgpd_route_t> rustbgpd_pending_withdrawals;
-
-// Set when a call failed because rustbgpd was not reachable or when our lease is gone
-bool rustbgpd_reconcile_needed = false;
+std::map<std::string, rustbgpd_route_state_t> rustbgpd_routes;
+uint64_t rustbgpd_last_version = 0;
 
 // Lease generation returned by the last leased add
 bool rustbgpd_lease_generation_known = false;
 rustbgpd::v1::LeaseGeneration rustbgpd_lease_generation;
+
+std::thread rustbgpd_worker;
+bool rustbgpd_worker_running = false;
+bool rustbgpd_worker_stop    = false;
+
+// Desired state changed, worker should not wait for next probe interval
+bool rustbgpd_work_pending = false;
+
+// Call in progress, we cancel it on shutdown
+grpc::ClientContext* rustbgpd_current_call = nullptr;
 
 void rustbgpd_prepare_context(grpc::ClientContext& context, unsigned int timeout_seconds) {
     context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(timeout_seconds));
@@ -86,7 +127,37 @@ bool rustbgpd_is_transient_error(const grpc::Status& status) {
 }
 
 // Must be called with rustbgpd_mutex held
-bool rustbgpd_add_route(const rustbgpd_route_t& route) {
+void rustbgpd_schedule_full_pass() {
+    for (auto& [key, state] : rustbgpd_routes) {
+        state.synced_version = 0;
+        state.retry_after    = rustbgpd_clock_t::time_point{};
+    }
+
+    rustbgpd_work_pending = true;
+    rustbgpd_worker_wakeup.notify_all();
+}
+
+// Runs gRPC call with context which shutdown can cancel
+template <typename Call> grpc::Status rustbgpd_run_call(grpc::ClientContext& context, Call call) {
+    {
+        std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+
+        if (rustbgpd_worker_stop) {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "FastNetMon is stopping");
+        }
+
+        rustbgpd_current_call = &context;
+    }
+
+    grpc::Status status = call();
+
+    std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+    rustbgpd_current_call = nullptr;
+
+    return status;
+}
+
+rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
     rustbgpd::v1::AddPathRequest path;
 
     path.set_prefix(route.prefix);
@@ -113,19 +184,23 @@ bool rustbgpd_add_route(const rustbgpd_route_t& route) {
         request.mutable_lease()->set_lease_seconds(fastnetmon_global_configuration.rustbgpd_lease_time);
 
         rustbgpd::v1::AddLeasedPathResponse response;
-        status = rustbgpd_injection_stub->AddLeasedPath(&context, request, &response);
+        status = rustbgpd_run_call(context,
+                                   [&] { return rustbgpd_injection_stub->AddLeasedPath(&context, request, &response); });
 
         if (status.ok()) {
             outcome = response.result().outcome();
 
             const auto& generation = response.generation();
 
+            std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+
             if (rustbgpd_lease_generation_known && (generation.incarnation() != rustbgpd_lease_generation.incarnation() ||
                                                     generation.sequence() != rustbgpd_lease_generation.sequence())) {
-                // Our previous lease expired or rustbgpd restarted. Routes added under it may be gone
+                // Our previous lease expired or rustbgpd restarted. Routes added under it, including ones added
+                // earlier in the current pass, may be gone
                 logger << log4cpp::Priority::WARN << "rustbgpd started new lease for owner "
                        << fastnetmon_global_configuration.rustbgpd_lease_owner << ", will announce all active bans again";
-                rustbgpd_reconcile_needed = true;
+                rustbgpd_schedule_full_pass();
             }
 
             rustbgpd_lease_generation       = generation;
@@ -133,7 +208,7 @@ bool rustbgpd_add_route(const rustbgpd_route_t& route) {
         }
     } else {
         rustbgpd::v1::AddPathResponse response;
-        status = rustbgpd_injection_stub->AddPath(&context, path, &response);
+        status = rustbgpd_run_call(context, [&] { return rustbgpd_injection_stub->AddPath(&context, path, &response); });
 
         if (status.ok()) {
             outcome = response.outcome();
@@ -149,21 +224,16 @@ bool rustbgpd_add_route(const rustbgpd_route_t& route) {
                    << "without lease. Remove it with: rbgp rib delete " << route.key() << " --override-owner";
         }
 
-        if (rustbgpd_is_transient_error(status)) {
-            rustbgpd_reconcile_needed = true;
-        }
-
-        return false;
+        return rustbgpd_is_transient_error(status) ? rustbgpd_call_result_t::transient_failure : rustbgpd_call_result_t::failure;
     }
 
     logger << log4cpp::Priority::INFO << "rustbgpd announced " << route.key() << " next hop " << route.next_hop
            << " outcome " << rustbgpd::v1::PathInjectOutcome_Name(outcome);
 
-    return true;
+    return rustbgpd_call_result_t::success;
 }
 
-// Must be called with rustbgpd_mutex held
-bool rustbgpd_delete_route(const rustbgpd_route_t& route) {
+rustbgpd_call_result_t rustbgpd_delete_route(const rustbgpd_route_t& route) {
     rustbgpd::v1::DeletePathRequest request;
 
     request.set_prefix(route.prefix);
@@ -180,75 +250,34 @@ bool rustbgpd_delete_route(const rustbgpd_route_t& route) {
     rustbgpd_prepare_context(context, rustbgpd_call_timeout);
 
     rustbgpd::v1::DeletePathResponse response;
-    grpc::Status status = rustbgpd_injection_stub->DeletePath(&context, request, &response);
+    grpc::Status status =
+        rustbgpd_run_call(context, [&] { return rustbgpd_injection_stub->DeletePath(&context, request, &response); });
 
     if (!status.ok()) {
         logger << log4cpp::Priority::ERROR << "rustbgpd rejected withdrawal of " << route.key() << ": "
                << rustbgpd_describe_status(status);
 
-        if (rustbgpd_is_transient_error(status)) {
-            rustbgpd_reconcile_needed = true;
-        }
-
-        return false;
+        return rustbgpd_is_transient_error(status) ? rustbgpd_call_result_t::transient_failure : rustbgpd_call_result_t::failure;
     }
 
     logger << log4cpp::Priority::INFO << "rustbgpd withdrew " << route.key() << " outcome "
            << rustbgpd::v1::PathDeleteOutcome_Name(response.outcome());
 
-    return true;
+    return rustbgpd_call_result_t::success;
 }
 
-// Announces all active bans and retries failed withdrawals. Must be called with rustbgpd_mutex held
-void rustbgpd_reconcile(const std::string& reason) {
-    logger << log4cpp::Priority::INFO << "rustbgpd reconcile (" << reason << "): " << rustbgpd_active_routes.size()
-           << " active bans, " << rustbgpd_pending_withdrawals.size() << " pending withdrawals";
-
-    bool transient_failure = false;
-    unsigned int failed    = 0;
-
-    for (auto it = rustbgpd_pending_withdrawals.begin(); it != rustbgpd_pending_withdrawals.end();) {
-        rustbgpd_reconcile_needed = false;
-
-        if (rustbgpd_delete_route(it->second)) {
-            it = rustbgpd_pending_withdrawals.erase(it);
-        } else {
-            failed++;
-            transient_failure = transient_failure || rustbgpd_reconcile_needed;
-            ++it;
-        }
-    }
-
-    for (const auto& [key, route] : rustbgpd_active_routes) {
-        rustbgpd_reconcile_needed = false;
-
-        if (!rustbgpd_add_route(route)) {
-            failed++;
-            transient_failure = transient_failure || rustbgpd_reconcile_needed;
-        }
-    }
-
-    // Retry soon only when rustbgpd was unreachable. A new lease generation seen during this pass
-    // needs no other pass as we have just announced everything
-    rustbgpd_reconcile_needed = transient_failure;
-
-    if (failed > 0) {
-        logger << log4cpp::Priority::ERROR << "rustbgpd reconcile finished with " << failed << " failed calls";
-    }
-}
-
-// Must be called with rustbgpd_mutex held
-void rustbgpd_renew_lease() {
+void rustbgpd_renew_lease(const rustbgpd::v1::LeaseGeneration& generation) {
     rustbgpd::v1::RenewLeaseRequest request;
     request.set_owner(fastnetmon_global_configuration.rustbgpd_lease_owner);
-    *request.mutable_generation() = rustbgpd_lease_generation;
+    *request.mutable_generation() = generation;
     request.set_lease_seconds(fastnetmon_global_configuration.rustbgpd_lease_time);
 
     grpc::ClientContext context;
     rustbgpd_prepare_context(context, rustbgpd_call_timeout);
 
     rustbgpd::v1::RenewLeaseResponse response;
-    grpc::Status status = rustbgpd_injection_stub->RenewLease(&context, request, &response);
+    grpc::Status status =
+        rustbgpd_run_call(context, [&] { return rustbgpd_injection_stub->RenewLease(&context, request, &response); });
 
     if (status.ok()) {
         return;
@@ -259,12 +288,13 @@ void rustbgpd_renew_lease() {
 
     if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {
         // Lease expired or rustbgpd restarted. First leased add will start new lease
+        std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
         rustbgpd_lease_generation_known = false;
-        rustbgpd_reconcile_needed       = true;
+        rustbgpd_schedule_full_pass();
     }
 }
 
-bool rustbgpd_check_liveness() {
+grpc::Status rustbgpd_check_liveness() {
     grpc::ClientContext context;
     rustbgpd_prepare_context(context, 1);
 
@@ -276,59 +306,174 @@ bool rustbgpd_check_liveness() {
     rustbgpd::v1::CheckLivenessRequest request;
     rustbgpd::v1::CheckLivenessResponse response;
 
-    return rustbgpd_control_stub->CheckLiveness(&context, request, &response).ok();
+    return rustbgpd_run_call(context, [&] { return rustbgpd_control_stub->CheckLiveness(&context, request, &response); });
 }
 
-void rustbgpd_reconcile_thread() {
-    using clock = std::chrono::steady_clock;
+// Applies result of call made for job. Must be called with rustbgpd_mutex held
+void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, rustbgpd_call_result_t result) {
+    auto it = rustbgpd_routes.find(key);
 
-    // So that we log if rustbgpd is not reachable on start
-    bool reachable = true;
+    if (it == rustbgpd_routes.end()) {
+        return;
+    }
 
-    auto next_reconcile = clock::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
-    auto next_renewal = clock::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
+    auto& state = it->second;
+
+    if (result != rustbgpd_call_result_t::success) {
+        // Unreachable rustbgpd: retry on next successful probe. Rejected call: retry on next periodic pass
+        state.retry_after =
+            result == rustbgpd_call_result_t::transient_failure ?
+                rustbgpd_clock_t::now() :
+                rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
+        return;
+    }
+
+    // Desired state changed while call was in progress. Worker will apply newer version
+    if (state.version != job.version) {
+        return;
+    }
+
+    state.synced_version = job.version;
+
+    if (state.contributors.empty()) {
+        rustbgpd_routes.erase(it);
+    }
+}
+
+void rustbgpd_worker_thread() {
+    bool reachable                    = true;
+    grpc::StatusCode last_probe_error = grpc::StatusCode::OK;
+
+    auto next_full_pass =
+        rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
+    auto next_renewal = rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
 
     while (true) {
-        std::this_thread::sleep_for(rustbgpd_probe_interval);
+        {
+            std::unique_lock<std::mutex> lock(rustbgpd_mutex);
+            rustbgpd_worker_wakeup.wait_for(lock, rustbgpd_probe_interval,
+                                            [] { return rustbgpd_worker_stop || rustbgpd_work_pending; });
 
-        bool alive = rustbgpd_check_liveness();
-
-        if (!alive) {
-            if (reachable) {
-                logger << log4cpp::Priority::ERROR << "rustbgpd is not reachable at " << fastnetmon_global_configuration.rustbgpd_target;
+            if (rustbgpd_worker_stop) {
+                return;
             }
 
-            reachable = false;
+            rustbgpd_work_pending = false;
+        }
+
+        grpc::Status probe = rustbgpd_check_liveness();
+
+        if (!probe.ok()) {
+            if (reachable || probe.error_code() != last_probe_error) {
+                logger << log4cpp::Priority::ERROR << "rustbgpd at " << fastnetmon_global_configuration.rustbgpd_target
+                       << " did not answer liveness probe: " << rustbgpd_describe_status(probe);
+            }
+
+            reachable        = false;
+            last_probe_error = probe.error_code();
             continue;
         }
 
-        std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+        std::vector<std::pair<std::string, rustbgpd_job_t>> jobs;
+        bool renew_lease = false;
+        rustbgpd::v1::LeaseGeneration generation;
 
-        if (!reachable) {
-            reachable = true;
-            rustbgpd_reconcile("rustbgpd is reachable");
-            next_reconcile = clock::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
-            continue;
-        }
+        {
+            std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
-        if (fastnetmon_global_configuration.rustbgpd_lease && rustbgpd_lease_generation_known && clock::now() >= next_renewal) {
-            if (rustbgpd_active_routes.empty()) {
-                // Nothing to keep, let lease expire
-                rustbgpd_lease_generation_known = false;
-            } else {
-                rustbgpd_renew_lease();
+            auto now = rustbgpd_clock_t::now();
+
+            if (!reachable) {
+                logger << log4cpp::Priority::INFO << "rustbgpd is reachable, will announce all "
+                       << rustbgpd_routes.size() << " routes again";
+                rustbgpd_schedule_full_pass();
+                next_full_pass = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
+            } else if (now >= next_full_pass) {
+                rustbgpd_schedule_full_pass();
+                next_full_pass = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
             }
 
-            next_renewal = clock::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
+            if (fastnetmon_global_configuration.rustbgpd_lease && rustbgpd_lease_generation_known && now >= next_renewal) {
+                bool any_wanted = false;
+
+                for (const auto& [key, state] : rustbgpd_routes) {
+                    any_wanted = any_wanted || !state.contributors.empty();
+                }
+
+                if (any_wanted) {
+                    renew_lease = true;
+                    generation  = rustbgpd_lease_generation;
+                } else {
+                    // Nothing to keep, let lease expire
+                    rustbgpd_lease_generation_known = false;
+                }
+
+                next_renewal = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
+            }
+
+            for (const auto& [key, state] : rustbgpd_routes) {
+                if (state.synced_version != state.version && state.retry_after <= now) {
+                    rustbgpd_job_t job;
+                    job.route    = state.route;
+                    job.announce = !state.contributors.empty();
+                    job.version  = state.version;
+
+                    jobs.push_back({ key, job });
+                }
+            }
         }
 
-        if (rustbgpd_reconcile_needed) {
-            rustbgpd_reconcile("previous calls failed");
-        } else if (clock::now() >= next_reconcile) {
-            rustbgpd_reconcile("periodic");
-            next_reconcile = clock::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
+        reachable        = true;
+        last_probe_error = grpc::StatusCode::OK;
+
+        if (renew_lease) {
+            rustbgpd_renew_lease(generation);
+        }
+
+        for (const auto& [key, job] : jobs) {
+            rustbgpd_call_result_t result = job.announce ? rustbgpd_add_route(job.route) : rustbgpd_delete_route(job.route);
+
+            std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+
+            if (rustbgpd_worker_stop) {
+                return;
+            }
+
+            rustbgpd_apply_result(key, job, result);
         }
     }
+}
+
+void rustbgpd_action_shutdown() {
+    {
+        std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+
+        if (!rustbgpd_worker_running) {
+            return;
+        }
+
+        rustbgpd_worker_stop = true;
+
+        if (rustbgpd_current_call != nullptr) {
+            rustbgpd_current_call->TryCancel();
+        }
+    }
+
+    rustbgpd_worker_wakeup.notify_all();
+    rustbgpd_worker.join();
+
+    std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+
+    rustbgpd_worker_running = false;
+    rustbgpd_worker_stop    = false;
+
+    rustbgpd_routes.clear();
+    rustbgpd_lease_generation_known = false;
+    rustbgpd_injection_stub.reset();
+    rustbgpd_control_stub.reset();
+    rustbgpd_token.clear();
+
+    logger << log4cpp::Priority::INFO << "rustbgpd action stopped";
 }
 
 void rustbgpd_read_bool(const std::string& name, bool& value) {
@@ -395,6 +540,11 @@ bool rustbgpd_target_is_local(const std::string& target) {
 bool rustbgpd_action_init() {
     logger << log4cpp::Priority::INFO << "rustbgpd action module loaded";
 
+    if (rustbgpd_worker_running) {
+        logger << log4cpp::Priority::ERROR << "rustbgpd action is already running";
+        return false;
+    }
+
     auto& configuration = fastnetmon_global_configuration;
 
     rustbgpd_read_string("rustbgpd_target", configuration.rustbgpd_target);
@@ -427,17 +577,19 @@ bool rustbgpd_action_init() {
         return false;
     }
 
+    std::string token;
+
     if (!configuration.rustbgpd_token_file.empty()) {
         std::ifstream token_file(configuration.rustbgpd_token_file);
 
-        if (!token_file.is_open() || !std::getline(token_file, rustbgpd_token)) {
+        if (!token_file.is_open() || !std::getline(token_file, token)) {
             logger << log4cpp::Priority::ERROR << "Cannot read token from rustbgpd_token_file " << configuration.rustbgpd_token_file;
             return false;
         }
 
-        boost::algorithm::trim(rustbgpd_token);
+        boost::algorithm::trim(token);
 
-        if (rustbgpd_token.empty()) {
+        if (token.empty()) {
             logger << log4cpp::Priority::ERROR << "rustbgpd_token_file " << configuration.rustbgpd_token_file << " is empty";
             return false;
         }
@@ -464,10 +616,24 @@ bool rustbgpd_action_init() {
 
     auto channel = grpc::CreateCustomChannel(configuration.rustbgpd_target, grpc::InsecureChannelCredentials(), channel_arguments);
 
-    rustbgpd_injection_stub = rustbgpd::v1::InjectionService::NewStub(channel);
-    rustbgpd_control_stub   = rustbgpd::v1::ControlService::NewStub(channel);
+    {
+        std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
-    std::thread(rustbgpd_reconcile_thread).detach();
+        rustbgpd_token          = token;
+        rustbgpd_injection_stub = rustbgpd::v1::InjectionService::NewStub(channel);
+        rustbgpd_control_stub   = rustbgpd::v1::ControlService::NewStub(channel);
+
+        rustbgpd_worker_running = true;
+        rustbgpd_worker         = std::thread(rustbgpd_worker_thread);
+    }
+
+    // Stop worker before global variables are destroyed on any exit path
+    static bool shutdown_registered = false;
+
+    if (!shutdown_registered) {
+        std::atexit(rustbgpd_action_shutdown);
+        shutdown_registered = true;
+    }
 
     logger << log4cpp::Priority::INFO << "rustbgpd action will use " << configuration.rustbgpd_target;
 
@@ -500,16 +666,20 @@ void rustbgpd_ban_manage(const std::string& action,
     const auto& configuration = fastnetmon_global_configuration;
 
     std::vector<rustbgpd_route_t> routes;
+    std::string host;
 
     if (ipv6) {
-        if (configuration.rustbgpd_announce_host_ipv6) {
-            char address[INET6_ADDRSTRLEN];
-            inet_ntop(AF_INET6, &client_ipv6.subnet_address, address, sizeof(address));
+        char address[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &client_ipv6.subnet_address, address, sizeof(address));
+        host = address;
 
-            routes.push_back(rustbgpd_build_route(address, 128, configuration.rustbgpd_next_hop_host_ipv6,
+        if (configuration.rustbgpd_announce_host_ipv6) {
+            routes.push_back(rustbgpd_build_route(host, 128, configuration.rustbgpd_next_hop_host_ipv6,
                                                   configuration.rustbgpd_community_host_ipv6));
         }
     } else {
+        host = convert_ip_as_uint_to_string(client_ip);
+
         if (configuration.rustbgpd_announce_whole_subnet) {
             routes.push_back(rustbgpd_build_route(convert_ip_as_uint_to_string(current_attack.customer_network.subnet_address),
                                                   current_attack.customer_network.cidr_prefix_length, configuration.rustbgpd_next_hop_subnet_ipv4,
@@ -517,27 +687,44 @@ void rustbgpd_ban_manage(const std::string& action,
         }
 
         if (configuration.rustbgpd_announce_host) {
-            routes.push_back(rustbgpd_build_route(convert_ip_as_uint_to_string(client_ip), 32, configuration.rustbgpd_next_hop_host_ipv4,
+            routes.push_back(rustbgpd_build_route(host, 32, configuration.rustbgpd_next_hop_host_ipv4,
                                                   configuration.rustbgpd_community_host));
         }
     }
 
     std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
-    for (const auto& route : routes) {
-        if (action == "ban") {
-            rustbgpd_pending_withdrawals.erase(route.key());
-            rustbgpd_active_routes[route.key()] = route;
-
-            // On failure route stays in active list and reconcile will announce it
-            rustbgpd_add_route(route);
-        } else {
-            rustbgpd_active_routes.erase(route.key());
-            rustbgpd_pending_withdrawals[route.key()] = route;
-
-            if (rustbgpd_delete_route(route)) {
-                rustbgpd_pending_withdrawals.erase(route.key());
-            }
-        }
+    if (!rustbgpd_worker_running) {
+        logger << log4cpp::Priority::ERROR << "rustbgpd action is not running, ignoring " << action << " for " << host;
+        return;
     }
+
+    for (const auto& route : routes) {
+        auto& state = rustbgpd_routes[route.key()];
+
+        bool wanted_before = !state.contributors.empty();
+
+        if (action == "ban") {
+            state.contributors.insert(host);
+        } else {
+            state.contributors.erase(host);
+        }
+
+        bool wanted_now = !state.contributors.empty();
+
+        // New entry or change between announce and withdrawal. Unban of route we do not know
+        // still sends withdrawal: rustbgpd may keep it from before FastNetMon restart
+        if (state.version == 0 || wanted_before != wanted_now) {
+            state.route       = route;
+            state.version     = ++rustbgpd_last_version;
+            state.retry_after = rustbgpd_clock_t::time_point{};
+        }
+
+        logger << log4cpp::Priority::INFO << "rustbgpd " << (wanted_now ? "announce" : "withdrawal") << " of "
+               << route.key() << " requested by " << action << " of " << host << ", " << state.contributors.size()
+               << " banned hosts need it";
+    }
+
+    rustbgpd_work_pending = true;
+    rustbgpd_worker_wakeup.notify_all();
 }
