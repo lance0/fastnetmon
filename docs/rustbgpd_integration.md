@@ -10,6 +10,8 @@ It was tested with rustbgpd 0.79.0. Earlier rustbgpd releases reject the `0.0.0.
 
 The action is built when gRPC support is built (`ENABLE_GOBGP_SUPPORT`, on by default). To leave it out, configure with `-DENABLE_RUSTBGPD_SUPPORT=OFF`.
 
+With `-DBUILD_TESTS=ON` the build also produces `rustbgpd_action_tests`, which runs the action against a mock of rustbgpd's gRPC API.
+
 The action uses a reduced copy of rustbgpd's API definition, `src/rustbgpd_client/rustbgpd_injection.proto`. Its header names the rustbgpd release it was copied from and that file's SHA-256.
 
 ## FastNetMon configuration
@@ -37,8 +39,8 @@ rustbgpd_community_host_ipv6 = 65535:666
 | Option | Default | Meaning |
 |---|---|---|
 | `rustbgpd` | `off` | Enable the action |
-| `rustbgpd_target` | `unix:///var/lib/rustbgpd/grpc.sock` | rustbgpd gRPC endpoint: `unix:///path`, or a loopback address and port such as `127.0.0.1:50051` |
-| `rustbgpd_token_file` | empty | File with the bearer token for a TCP listener; sent as `authorization: Bearer <token>` on every call |
+| `rustbgpd_target` | `unix:///var/lib/rustbgpd/grpc.sock` | rustbgpd gRPC endpoint: `unix:///absolute/path`, or a literal loopback address and port: `127.0.0.1:50051` (any address in 127.0.0.0/8) or `[::1]:50051`. Host names are not accepted |
+| `rustbgpd_token_file` | empty | File with the bearer token; sent as `authorization: Bearer <token>` on every call. Required for a TCP target. It must be a regular file (not a symbolic link) owned by the user who runs FastNetMon or by root, with no group or other permissions (`chmod 600`), at most 4096 bytes, one token of printable ASCII characters |
 | `rustbgpd_next_hop_host_ipv4` | `0.0.0.0` | Next hop for IPv4 host announces; `0.0.0.0` means next hop self |
 | `rustbgpd_next_hop_subnet_ipv4` | `0.0.0.0` | Next hop for IPv4 subnet announces |
 | `rustbgpd_next_hop_host_ipv6` | `::` | Next hop for IPv6 host announces; `::` means next hop self |
@@ -48,14 +50,14 @@ rustbgpd_community_host_ipv6 = 65535:666
 | `rustbgpd_community_host`, `rustbgpd_community_subnet`, `rustbgpd_community_host_ipv6` | `65535:666` | Community in `ASN:value` form; `65535:666` is BLACKHOLE (RFC 7999) |
 | `rustbgpd_reconcile_interval` | `30` | Seconds between passes which announce all active bans again |
 | `rustbgpd_lease` | `off` | Announce under an injection lease, see below |
-| `rustbgpd_lease_owner` | `fastnetmon` | Lease owner name, 1-64 characters of `A-Z a-z 0-9 . _ -` |
+| `rustbgpd_lease_owner` | `fastnetmon` | Lease owner name, 1-64 characters of `A-Z a-z 0-9 . _ -`, checked on start when leases are on |
 | `rustbgpd_lease_time` | `30` | Lease time in seconds, 5-3600 |
 
-FastNetMon does not start the action when an option is invalid, and logs which one.
+FastNetMon does not start the action when an option is invalid, and logs which one. It never logs the token.
 
 ### Connecting to rustbgpd
 
-rustbgpd accepts plaintext gRPC only on its owner-only Unix socket or on a TCP listener with a bearer token. The action allows only a Unix socket or a loopback address, so the token never leaves the host.
+rustbgpd accepts plaintext gRPC only on its owner-only Unix socket or on a TCP listener with a bearer token. The action allows only a Unix socket or a literal loopback address, so the token never leaves the host, and it refuses a TCP target without a token.
 
 - **Unix socket** (default). rustbgpd authorizes clients of its owner-only socket as its local operator; no token is needed. FastNetMon must be able to open the socket: run it as rustbgpd's user, or as root.
 - **Loopback TCP with token.** Configure the listener in rustbgpd and map its principal to the `operator` role, which route injection requires:
@@ -106,24 +108,36 @@ local_ipv6_nexthop = "2001:db8:126::1"
 export_policy_chain = ["rtbh-only"]
 ```
 
-Add statements for other prefix lengths and communities if you enable `rustbgpd_announce_whole_subnet` or use other communities.
+If you enable `rustbgpd_announce_whole_subnet`, add a statement for your customer networks, for example:
+
+```toml
+[[policy.definitions.rtbh-only.statements]]
+action = "permit"
+match_route_type = "local"
+prefix = "203.0.113.0/24"
+match_community = ["BLACKHOLE"]
+```
+
+Change `match_community` too if you use another community.
 
 ## Behaviour
 
-- Each call is checked. The log shows the outcome rustbgpd returns: `PATH_INJECT_OUTCOME_CREATED`, `REPLACED` or `UNCHANGED` for an announce, `PATH_DELETE_OUTCOME_DELETED` or `NOT_PRESENT` for a withdrawal, or the gRPC error.
+- Ban and unban only update the list of routes FastNetMon wants, in the order they happen. One worker thread makes all calls to rustbgpd and brings rustbgpd to that list, so a slow or failed call never delays detection, and an unban that arrives while the announce is still in flight is applied after it.
+- With `rustbgpd_announce_whole_subnet = on`, the subnet route stays announced while any banned host from that subnet needs it, and is withdrawn after the last one is unbanned.
+- Each call is checked. The log shows the outcome rustbgpd returns: `PATH_INJECT_OUTCOME_CREATED`, `REPLACED` or `UNCHANGED` for an announce, `PATH_DELETE_OUTCOME_DELETED` or `NOT_PRESENT` for a withdrawal, or the gRPC error with its status name. An answer without one of these outcomes (rustbgpd older than 0.79.0, for example) counts as a failure.
 - Withdrawals set `allow_missing`, so withdrawing a route rustbgpd no longer has succeeds.
-- rustbgpd keeps injected routes in memory only. The action keeps its list of active bans and announces all of them again:
-  - as soon as rustbgpd answers after its liveness probe failed, for example after a rustbgpd restart (the action probes every 0.5 seconds);
-  - after a call failed because rustbgpd was unreachable;
+- A call rustbgpd rejects is retried after `rustbgpd_reconcile_interval` seconds, but at most 10 seconds later. A call that failed because rustbgpd was unreachable is retried as soon as rustbgpd answers again.
+- rustbgpd keeps injected routes in memory only. The action announces all wanted routes again:
+  - as soon as rustbgpd answers after its liveness probe failed, for example after a rustbgpd restart (the action probes every 0.5 seconds and logs the status of a failed probe);
+  - when rustbgpd starts a new lease generation, if leases are on;
   - every `rustbgpd_reconcile_interval` seconds.
-
-  A withdrawal which failed is retried the same way.
 - On a planned rustbgpd restart, BGP peers with Graceful Restart keep the blackholes as stale routes. rustbgpd sends End-of-RIB soon after the session comes back, and the action announces the bans again shortly after rustbgpd's API answers. A short gap between the two is possible, so a peer may drop a blackhole for a moment. A restart faster than one probe interval is caught by the periodic pass instead.
+- FastNetMon stops the worker on shutdown and cancels a call in flight.
 - Ban lists are not persistent in FastNetMon either. If FastNetMon stops, its bans stay in rustbgpd until they are withdrawn by hand (`rbgp rib delete <prefix>`) or until rustbgpd restarts, unless leases are on.
 
 ## Leases (experimental)
 
-With `rustbgpd_lease = on` the action uses `AddLeasedPath` instead of `AddPath`, all under one owner (`rustbgpd_lease_owner`), and renews the lease every third of `rustbgpd_lease_time`. If FastNetMon stops renewing, rustbgpd withdraws all of the owner's bans when the lease expires. When rustbgpd refuses a renewal, the action announces all active bans again under a new lease.
+With `rustbgpd_lease = on` the action uses `AddLeasedPath` instead of `AddPath`, all under one owner (`rustbgpd_lease_owner`), and renews the lease every third of `rustbgpd_lease_time`. If FastNetMon stops renewing, rustbgpd withdraws all of the owner's bans when the lease expires. When rustbgpd refuses a renewal, or answers an announce with a new lease generation, the action announces all wanted routes again under the new lease.
 
 The lease calls (`AddLeasedPath`, `RenewLease`) are not part of rustbgpd's stable v1 API in rustbgpd 0.79.0 and may change in later releases.
 
