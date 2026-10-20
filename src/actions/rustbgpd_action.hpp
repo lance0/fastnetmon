@@ -6,6 +6,8 @@
 
 #include <string>
 
+#include <sys/stat.h>
+
 bool rustbgpd_action_init();
 
 // Stops worker thread. Safe to call more than once
@@ -21,3 +23,7 @@ void rustbgpd_ban_manage(const std::string& action,
                          uint32_t client_ip,
                          const subnet_ipv6_cidr_mask_t& client_ipv6,
                          const attack_details_t& current_attack);
+
+// Decides whether metadata of rustbgpd_token_file allows us to use it: regular file owned by effective_uid or root,
+// no access for group or others. Returns empty string or reason to reject it
+std::string rustbgpd_check_token_file_metadata(const struct stat& file_stat, uid_t effective_uid);

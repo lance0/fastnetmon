@@ -657,6 +657,38 @@ TEST_F(RustbgpdActionTest, token_file_checks) {
     EXPECT_EQ(captured_log->text().find("secret"), std::string::npos) << "token content in log";
 }
 
+TEST(rustbgpd_token_file_metadata, owner_and_mode) {
+    uid_t me = 1000;
+
+    struct stat file_stat {};
+    file_stat.st_mode = S_IFREG | 0600;
+
+    file_stat.st_uid = me;
+    EXPECT_EQ(rustbgpd_check_token_file_metadata(file_stat, me), "");
+
+    file_stat.st_uid = 0;
+    EXPECT_EQ(rustbgpd_check_token_file_metadata(file_stat, me), "");
+
+    file_stat.st_uid = me + 1;
+    EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me), "") << "accepted file of another user";
+
+    file_stat.st_uid  = me;
+    file_stat.st_mode = S_IFREG | 0400;
+    EXPECT_EQ(rustbgpd_check_token_file_metadata(file_stat, me), "");
+
+    file_stat.st_mode = S_IFREG | 0604;
+    EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me), "");
+
+    file_stat.st_mode = S_IFREG | 0610;
+    EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me), "");
+
+    file_stat.st_mode = S_IFDIR | 0700;
+    EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me), "");
+
+    file_stat.st_mode = S_IFIFO | 0600;
+    EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me), "");
+}
+
 TEST_F(RustbgpdActionTest, lease_owner_checked_when_leases_enabled) {
     configuration_map["rustbgpd_lease"] = "on";
 

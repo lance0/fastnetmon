@@ -707,6 +707,22 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
     return true;
 }
 
+std::string rustbgpd_check_token_file_metadata(const struct stat& file_stat, uid_t effective_uid) {
+    if (!S_ISREG(file_stat.st_mode)) {
+        return "it is not a regular file";
+    }
+
+    if (file_stat.st_uid != effective_uid && file_stat.st_uid != 0) {
+        return "it must be owned by the user who runs FastNetMon or by root";
+    }
+
+    if ((file_stat.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        return "it must not be accessible by group or others, use chmod 600";
+    }
+
+    return "";
+}
+
 // Reads bearer token. File must be regular file of user who runs FastNetMon or root, without access for group
 // and others. We never log token itself
 bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
@@ -725,12 +741,8 @@ bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
 
     if (fstat(fd, &file_stat) != 0) {
         error = std::string("cannot stat it: ") + strerror(errno);
-    } else if (!S_ISREG(file_stat.st_mode)) {
-        error = "it is not a regular file";
-    } else if (file_stat.st_uid != geteuid() && file_stat.st_uid != 0) {
-        error = "it must be owned by the user who runs FastNetMon or by root";
-    } else if ((file_stat.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-        error = "it must not be accessible by group or others, use chmod 600";
+    } else {
+        error = rustbgpd_check_token_file_metadata(file_stat, geteuid());
     }
 
     std::string content;
