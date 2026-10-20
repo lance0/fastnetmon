@@ -66,6 +66,7 @@
 
 #ifdef ENABLE_RUSTBGPD
 #include "actions/rustbgpd_action.hpp"
+#include <unistd.h>
 #endif
 
 #include "bgp_protocol_flow_spec.hpp"
@@ -2206,7 +2207,14 @@ void interruption_signal_handler(int signal_number) {
 #ifdef ENABLE_RUSTBGPD
     if (fastnetmon_global_configuration.rustbgpd) {
         logger << log4cpp::Priority::INFO << "Stop rustbgpd action";
-        rustbgpd_action_signal_shutdown();
+
+        if (!rustbgpd_action_signal_shutdown()) {
+            // Its worker still runs and exit() would destroy objects it uses. Only async-signal-safe calls here
+            const char notice[] = "rustbgpd action did not stop in time, exiting without cleanup\n";
+            ssize_t written     = write(STDERR_FILENO, notice, sizeof(notice) - 1);
+            (void)written;
+            _exit(1);
+        }
     }
 #endif
 

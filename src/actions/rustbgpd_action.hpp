@@ -13,9 +13,13 @@ bool rustbgpd_action_init();
 // Stops worker thread. Safe to call more than once
 void rustbgpd_action_shutdown();
 
-// Stops worker from signal handler: only async-signal-safe operations, never locks or joins.
-// Waits up to call deadline for worker to finish. rustbgpd_action_shutdown does nothing after it
-void rustbgpd_action_signal_shutdown();
+// Stops worker from signal handler: only async-signal-safe operations, never locks or joins. Waits up to 6 seconds
+// for worker to finish. Returns false if it is still running: then caller must leave with _exit(), as exit() would
+// destroy objects worker uses. rustbgpd_action_shutdown does nothing after it
+bool rustbgpd_action_signal_shutdown();
+
+// Test hook called by action at named points, never set in FastNetMon
+extern void (*rustbgpd_test_checkpoint)(const char* point);
 
 // Only changes desired state, gRPC calls are made by worker thread. Call it in order of ban and unban events
 void rustbgpd_ban_manage(const std::string& action,

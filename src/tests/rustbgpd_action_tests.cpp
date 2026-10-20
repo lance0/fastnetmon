@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -58,23 +59,10 @@ class captured_log_t : public log4cpp::LayoutAppender {
         buffer.clear();
     }
 
-    // Raise this signal from inside logging of ban request. Action logs it while it holds its lock
-    std::atomic<int> raise_on_ban_request{ 0 };
-
     protected:
     void _append(const log4cpp::LoggingEvent& event) override {
-        {
-            std::lock_guard<std::mutex> lock_guard(mutex);
-            buffer += event.message + "\n";
-        }
-
-        int signal_number = raise_on_ban_request.exchange(0);
-
-        if (signal_number != 0 && event.message.find("requested by ban") != std::string::npos) {
-            raise(signal_number);
-        } else if (signal_number != 0) {
-            raise_on_ban_request = signal_number;
-        }
+        std::lock_guard<std::mutex> lock_guard(mutex);
+        buffer += event.message + "\n";
     }
 
     private:
@@ -461,6 +449,54 @@ TEST_F(RustbgpdActionTest, exit_without_shutdown_is_clean) {
         ::testing::ExitedWithCode(0), "");
 }
 
+std::atomic<pid_t> worker_thread_id{ 0 };
+
+// Same steps as FastNetMon's interruption_signal_handler for this action. Exit code 3 if it ran on worker thread
+void production_signal_handler(int signal_number) {
+    bool on_worker = syscall(SYS_gettid) == worker_thread_id;
+
+    if (!rustbgpd_action_signal_shutdown()) {
+        const char notice[] = "rustbgpd action did not stop in time, exiting without cleanup\n";
+        ssize_t written     = write(STDERR_FILENO, notice, sizeof(notice) - 1);
+        (void)written;
+        _exit(1);
+    }
+
+    exit(on_worker ? 3 : 0);
+}
+
+// Checkpoints which tests set as rustbgpd_test_checkpoint
+std::atomic<bool> raise_on_ban_manage{ false };
+std::atomic<bool> hold_worker_after_announce{ false };
+std::atomic<bool> worker_held{ false };
+
+void test_checkpoint(const char* point) {
+    if (strcmp(point, "ban_manage_locked") == 0 && raise_on_ban_manage.exchange(false)) {
+        raise(SIGINT);
+    }
+
+    if (strcmp(point, "announce_returned") == 0) {
+        while (hold_worker_after_announce) {
+            worker_held = true;
+            std::this_thread::sleep_for(1ms);
+        }
+    }
+}
+
+// Releases held worker after all other static objects of this program are destroyed: objects with init priority
+// 101 are constructed first and destroyed last. Only exit() runs it
+class teardown_release_t {
+    public:
+    ~teardown_release_t() {
+        if (hold_worker_after_announce.exchange(false)) {
+            std::this_thread::sleep_for(1s);
+        }
+    }
+};
+
+teardown_release_t teardown_release __attribute__((init_priority(101)));
+
+#ifdef __linux__
 // Thread id of action's worker thread, 0 if there is no such thread
 pid_t find_worker_thread() {
     for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task")) {
@@ -475,21 +511,13 @@ pid_t find_worker_thread() {
     return 0;
 }
 
-std::atomic<pid_t> worker_thread_id{ 0 };
-
-// Same steps as FastNetMon's interruption_signal_handler, and tells which thread it ran on
-void test_signal_handler(int signal_number) {
-    rustbgpd_action_signal_shutdown();
-    exit(syscall(SYS_gettid) == worker_thread_id ? 3 : 0);
-}
-
 // Signal sent to worker thread must not run handler there: handler would wait for or join the thread it runs on
 TEST_F(RustbgpdActionTest, signal_is_never_handled_on_worker_thread) {
     EXPECT_EXIT(
         {
             // Hang is failure too
             alarm(20);
-            signal(SIGUSR1, test_signal_handler);
+            signal(SIGINT, production_signal_handler);
 
             if (!rustbgpd_action_init()) {
                 exit(2);
@@ -504,42 +532,64 @@ TEST_F(RustbgpdActionTest, signal_is_never_handled_on_worker_thread) {
                 exit(4);
             }
 
-            syscall(SYS_tgkill, getpid(), worker_thread_id.load(), SIGUSR1);
+            syscall(SYS_tgkill, getpid(), worker_thread_id.load(), SIGINT);
             std::this_thread::sleep_for(1s);
 
             // Worker keeps it pending, so this thread handles it
-            raise(SIGUSR1);
+            raise(SIGINT);
             std::this_thread::sleep_for(30s);
             exit(5);
         },
         ::testing::ExitedWithCode(0), "");
 }
+#endif
 
-// Like test_signal_handler, but runs action's atexit function itself and leaves with _exit: our signal is raised
-// inside log4cpp, which still holds its own lock, and log4cpp's teardown in exit() would wait for it
-void test_signal_handler_inside_logging(int signal_number) {
-    rustbgpd_action_signal_shutdown();
-    rustbgpd_action_shutdown();
-    _exit(0);
-}
-
-// Signal handler runs on thread which holds action's lock: shutdown from handler must not lock it again
+// Signal handler runs on thread which holds action's lock: shutdown from handler must not lock it again. Worker may
+// stop in time (exit 0) or wait for that lock (exit 1 without cleanup), both are fine. Hang or crash are not
 TEST_F(RustbgpdActionTest, signal_while_lock_is_held_does_not_deadlock) {
     EXPECT_EXIT(
         {
             alarm(20);
-            signal(SIGUSR1, test_signal_handler_inside_logging);
+            signal(SIGINT, production_signal_handler);
 
             if (!rustbgpd_action_init()) {
                 exit(2);
             }
 
-            captured_log->raise_on_ban_request = SIGUSR1;
+            rustbgpd_test_checkpoint = test_checkpoint;
+            raise_on_ban_manage      = true;
             ipv4_action("ban", "203.0.113.7");
             std::this_thread::sleep_for(30s);
             exit(5);
         },
-        ::testing::ExitedWithCode(0), "");
+        [](int status) { return WIFEXITED(status) && (WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 1); }, "");
+}
+
+// Worker does not stop within the bound: handler must leave without destroying objects worker still uses. With
+// exit() the worker continues during teardown and uses destroyed objects
+TEST_F(RustbgpdActionTest, worker_held_past_stop_timeout_exits_without_teardown) {
+    EXPECT_EXIT(
+        {
+            alarm(30);
+            signal(SIGINT, production_signal_handler);
+
+            if (!rustbgpd_action_init()) {
+                exit(2);
+            }
+
+            rustbgpd_test_checkpoint   = test_checkpoint;
+            hold_worker_after_announce = true;
+            ipv4_action("ban", "203.0.113.7");
+
+            if (!wait_for([&] { return worker_held.load(); }, 3s)) {
+                exit(4);
+            }
+
+            raise(SIGINT);
+            std::this_thread::sleep_for(30s);
+            exit(5);
+        },
+        ::testing::ExitedWithCode(1), "rustbgpd action did not stop in time");
 }
 
 // Subnet announce stays while any banned host of that subnet needs it
@@ -777,6 +827,11 @@ TEST_F(RustbgpdActionTest, liveness_failure_status_is_logged) {
                    std::string::npos;
         },
         3s));
+}
+
+// Sanitizer failure must not look like exit code 1 of a test
+extern "C" const char* __asan_default_options() {
+    return "exitcode=66";
 }
 
 int main(int argc, char** argv) {

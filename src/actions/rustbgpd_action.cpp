@@ -124,6 +124,9 @@ std::atomic<bool> rustbgpd_worker_exited{ true };
 // Desired state changed, worker should not wait for next probe interval
 bool rustbgpd_work_pending = false;
 
+// Test hook, never set in FastNetMon
+void (*rustbgpd_test_checkpoint)(const char* point) = nullptr;
+
 // Call in progress, we cancel it on shutdown
 grpc::ClientContext* rustbgpd_current_call = nullptr;
 
@@ -253,6 +256,10 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
         if (status.ok()) {
             outcome = response.outcome();
         }
+    }
+
+    if (rustbgpd_test_checkpoint != nullptr) {
+        rustbgpd_test_checkpoint("announce_returned");
     }
 
     if (!status.ok()) {
@@ -573,17 +580,19 @@ void rustbgpd_action_shutdown() {
     logger << log4cpp::Priority::INFO << "rustbgpd action stopped";
 }
 
-void rustbgpd_action_signal_shutdown() {
+bool rustbgpd_action_signal_shutdown() {
     // Only async-signal-safe operations: lock free atomics and nanosleep
     rustbgpd_signal_stop = true;
 
-    // Worker blocks all signals, so we never run on it. It stops before its next call; call in progress ends by its
-    // deadline. If this signal interrupted thread which holds rustbgpd_mutex, worker may wait for that lock forever,
-    // so we wait for limited time only
+    // Worker does not get this signal, so we never run on it. It stops before its next call; call in progress ends
+    // by its deadline. If this signal interrupted thread which holds rustbgpd_mutex, worker may wait for that lock
+    // forever, so we wait for call deadline plus one second only: 6 seconds
     for (unsigned int i = 0; i < (rustbgpd_call_timeout + 1) * 100 && !rustbgpd_worker_exited; i++) {
         struct timespec delay = { 0, 10 * 1000 * 1000 };
         nanosleep(&delay, nullptr);
     }
+
+    return rustbgpd_worker_exited;
 }
 
 void rustbgpd_read_bool(const std::string& name, bool& value) {
@@ -1017,6 +1026,10 @@ void rustbgpd_ban_manage(const std::string& action,
         logger << log4cpp::Priority::INFO << "rustbgpd " << (wanted_now ? "announce" : "withdrawal") << " of "
                << route.key() << " requested by " << action << " of " << host << ", " << state.contributors.size()
                << " banned hosts need it";
+    }
+
+    if (rustbgpd_test_checkpoint != nullptr) {
+        rustbgpd_test_checkpoint("ban_manage_locked");
     }
 
     rustbgpd_work_pending = true;
