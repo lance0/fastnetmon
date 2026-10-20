@@ -36,11 +36,15 @@
 
 #include "../actions/rustbgpd_action.hpp"
 #include "../fastnetmon_configuration_scheme.hpp"
+
+#include "../ban_list.hpp"
 #include "../rustbgpd_client/rustbgpd_injection.grpc.pb.h"
 
 log4cpp::Category& logger = log4cpp::Category::getRoot();
 std::map<std::string, std::string> configuration_map;
 fastnetmon_configuration_t fastnetmon_global_configuration;
+blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
 
 using namespace std::chrono_literals;
 
@@ -324,6 +328,13 @@ class RustbgpdActionTest : public ::testing::Test {
         attack_details_t attack;
         attack.customer_network = customer_network;
 
+        // Same order as FastNetMon: ban list first, then actions. Unban as API does it
+        if (action == "ban") {
+            ban_list_ipv4.add_to_blackhole(inet_addr(host.c_str()), attack);
+        } else {
+            ban_list_ipv4.remove_from_blackhole(inet_addr(host.c_str()));
+        }
+
         rustbgpd_ban_manage(action, false, inet_addr(host.c_str()), subnet_ipv6_cidr_mask_t{}, attack);
     }
 
@@ -382,6 +393,31 @@ TEST_F(RustbgpdActionTest, unban_during_slow_announce_withdraws) {
 
     std::this_thread::sleep_for(1500ms);
     EXPECT_FALSE(state.has("203.0.113.7/32")) << "route came back after unban";
+}
+
+// Ban thread adds host to ban list and stalls (attack file I/O) before it calls actions. Unban from API removes
+// host and calls actions first. Late ban must not announce host which is not banned anymore
+TEST_F(RustbgpdActionTest, late_ban_after_unban_is_ignored) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    uint32_t host = inet_addr("203.0.113.7");
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24);
+
+    // Ban thread: host into ban list, then it stalls
+    ban_list_ipv4.add_to_blackhole(host, attack);
+
+    // API unban: out of ban list, then actions
+    ban_list_ipv4.remove_from_blackhole(host);
+    rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+
+    // Ban thread resumes and calls actions
+    rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+
+    ASSERT_TRUE(wait_for([&] { return state.deletes >= 1; }, 3s));
+    std::this_thread::sleep_for(1s);
+    EXPECT_FALSE(state.has("203.0.113.7/32")) << "late ban announced host which is not banned";
+    EXPECT_NE(captured_log->text().find("rustbgpd ignores ban of 203.0.113.7"), std::string::npos);
 }
 
 // Failed answer for announce which is already outdated must not delay withdrawal which replaced it

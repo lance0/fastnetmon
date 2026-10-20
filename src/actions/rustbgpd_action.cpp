@@ -31,7 +31,12 @@
 
 #include "../fastnetmon_configuration_scheme.hpp"
 
+#include "../ban_list.hpp"
+
 extern fastnetmon_configuration_t fastnetmon_global_configuration;
+
+extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
 
 // rustbgpd action: announces and withdraws blackholes through rustbgpd's InjectionService
 // https://github.com/lance0/rustbgpd/blob/main/docs/reference/api.md#injectionservice
@@ -1004,6 +1009,19 @@ void rustbgpd_ban_manage(const std::string& action,
 
     if (!rustbgpd_worker_running) {
         logger << log4cpp::Priority::ERROR << "rustbgpd action is not running, ignoring " << action << " for " << host;
+        return;
+    }
+
+    // FastNetMon adds host to its ban list and may write attack details to disk before it calls us, and nothing
+    // keeps these steps together with unban. Unban removes host from ban list before it calls actions (API) or
+    // shortly after (unban of expired bans). Ban which reaches us after host left ban list was overtaken by its unban
+    // and must not announce anything. We check under our lock, so unban which removes host after this check waits
+    // for us and is applied after this ban
+    bool still_banned = ipv6 ? ban_list_ipv6.is_blackholed(client_ipv6) : ban_list_ipv4.is_blackholed(client_ip);
+
+    if (action == "ban" && !still_banned) {
+        logger << log4cpp::Priority::WARN << "rustbgpd ignores ban of " << host
+               << ": host is not in FastNetMon ban list anymore, its unban came first";
         return;
     }
 
