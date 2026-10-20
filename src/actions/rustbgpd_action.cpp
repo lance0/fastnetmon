@@ -902,12 +902,14 @@ bool rustbgpd_action_init() {
     channel_arguments.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 250);
     channel_arguments.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 250);
 
-    // Worker and threads gRPC starts for our channel inherit our signal mask. With all signals blocked
-    // FastNetMon's signal handler never runs on them
-    sigset_t all_signals;
+    // Worker and threads gRPC starts for our channel inherit our signal mask. With SIGINT blocked FastNetMon's
+    // shutdown handler never runs on them. We do not block other signals: synchronous faults as SIGSEGV must reach
+    // FastNetMon's crash handler, and blocking them has undefined results
+    sigset_t shutdown_signals;
     sigset_t previous_signals;
-    sigfillset(&all_signals);
-    pthread_sigmask(SIG_BLOCK, &all_signals, &previous_signals);
+    sigemptyset(&shutdown_signals);
+    sigaddset(&shutdown_signals, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &shutdown_signals, &previous_signals);
 
     auto channel = grpc::CreateCustomChannel(grpc_target, grpc::InsecureChannelCredentials(), channel_arguments);
 

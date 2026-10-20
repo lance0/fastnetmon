@@ -519,6 +519,40 @@ pid_t find_worker_thread() {
     return 0;
 }
 
+// Signals blocked on thread, from SigBlk in /proc/self/task/<thread>/status
+uint64_t blocked_signals(pid_t thread) {
+    std::ifstream status("/proc/self/task/" + std::to_string(thread) + "/status");
+    std::string line;
+
+    while (std::getline(status, line)) {
+        if (line.rfind("SigBlk:", 0) == 0) {
+            return std::stoull(line.substr(strlen("SigBlk:")), nullptr, 16);
+        }
+    }
+
+    return 0;
+}
+
+bool signal_in_mask(uint64_t mask, int signal_number) {
+    return (mask >> (signal_number - 1)) & 1;
+}
+
+// Worker blocks SIGINT, which FastNetMon handles for shutdown, and no fault signals
+TEST_F(RustbgpdActionTest, worker_blocks_only_shutdown_signal) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    pid_t worker = find_worker_thread();
+    ASSERT_NE(worker, 0);
+
+    uint64_t mask = blocked_signals(worker);
+
+    EXPECT_TRUE(signal_in_mask(mask, SIGINT));
+
+    for (int fault_signal : { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT }) {
+        EXPECT_FALSE(signal_in_mask(mask, fault_signal)) << "worker blocks signal " << fault_signal;
+    }
+}
+
 // Signal sent to worker thread must not run handler there: handler would wait for or join the thread it runs on
 TEST_F(RustbgpdActionTest, signal_is_never_handled_on_worker_thread) {
     EXPECT_EXIT(
