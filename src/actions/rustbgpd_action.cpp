@@ -371,6 +371,12 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
 
     auto& state = it->second;
 
+    // Desired state changed while call was in progress. Worker applies newer version next, result of older one
+    // must not delay it, whatever it was
+    if (state.version != job.version) {
+        return;
+    }
+
     if (result != rustbgpd_call_result_t::success) {
         // Unreachable rustbgpd: retry on next successful probe. Rejected call or answer we do not understand: retry
         // after rustbgpd_reconcile_interval but not later than in 10 seconds, operator may fix cause in meantime
@@ -382,11 +388,6 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
         if (result == rustbgpd_call_result_t::failure) {
             state.retry_after += retry_delay;
         }
-        return;
-    }
-
-    // Desired state changed while call was in progress. Worker will apply newer version
-    if (state.version != job.version) {
         return;
     }
 

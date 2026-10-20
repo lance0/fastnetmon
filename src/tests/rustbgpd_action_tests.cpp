@@ -97,6 +97,12 @@ class mock_state_t {
 
     std::atomic<int> add_delay_ms{ 0 };
 
+    // Announces wait while it is set
+    std::atomic<bool> hold_adds{ false };
+
+    // Answer next announce without outcome
+    std::atomic<bool> omit_next_add_outcome{ false };
+
     // Answer OK without outcome
     std::atomic<bool> omit_outcome{ false };
 
@@ -215,6 +221,10 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
 
         std::this_thread::sleep_for(std::chrono::milliseconds(state.add_delay_ms.load()));
 
+        while (state.hold_adds) {
+            std::this_thread::sleep_for(5ms);
+        }
+
         std::lock_guard<std::mutex> lock_guard(state.mutex);
 
         auto authorization = context->client_metadata().find("authorization");
@@ -233,7 +243,7 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
     }
 
     void set_outcome(rustbgpd::v1::AddPathResponse* response, rustbgpd::v1::PathInjectOutcome outcome) {
-        if (!state.omit_outcome) {
+        if (!state.omit_outcome && !state.omit_next_add_outcome.exchange(false)) {
             response->set_outcome(outcome);
         }
     }
@@ -370,6 +380,23 @@ TEST_F(RustbgpdActionTest, unban_during_slow_announce_withdraws) {
 
     std::this_thread::sleep_for(1500ms);
     EXPECT_FALSE(state.has("203.0.113.7/32")) << "route came back after unban";
+}
+
+// Failed answer for announce which is already outdated must not delay withdrawal which replaced it
+TEST_F(RustbgpdActionTest, failed_outdated_announce_does_not_delay_withdrawal) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    state.hold_adds = true;
+    ipv4_action("ban", "203.0.113.7");
+    ASSERT_TRUE(wait_for([&] { return state.adds_started == 1; }, 3s));
+
+    // Unban while announce is in flight, then announce gets answer which action does not accept
+    ipv4_action("unban", "203.0.113.7");
+    state.omit_next_add_outcome = true;
+    state.hold_adds             = false;
+
+    EXPECT_TRUE(wait_for([&] { return state.deletes >= 1 && !state.has("203.0.113.7/32"); }, 2s))
+        << "withdrawal waited for retry delay of outdated announce";
 }
 
 // Shutdown cancels call in flight, joins worker and no calls happen after it
