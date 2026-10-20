@@ -123,7 +123,8 @@ Change `match_community` too if you use another community.
 ## Behaviour
 
 - Ban and unban only update the list of routes FastNetMon wants, in the order they happen. One worker thread makes all calls to rustbgpd and brings rustbgpd to that list, so a slow or failed call never delays detection, and an unban that arrives while the announce is still in flight is applied after it.
-- With `rustbgpd_announce_whole_subnet = on`, the subnet route stays announced while any banned host from that subnet needs it, and is withdrawn after the last one is unbanned.
+- With `rustbgpd_announce_whole_subnet = on`, the subnet route stays announced while any banned host from that subnet needs it, and is withdrawn after the last one is unbanned. An attack without customer network (0.0.0.0/0) gets no subnet announce, only an error in the log.
+- A ban for a host which is no longer in FastNetMon's ban list is ignored: its unban came first.
 - Each call is checked. The log shows the outcome rustbgpd returns: `PATH_INJECT_OUTCOME_CREATED`, `REPLACED` or `UNCHANGED` for an announce, `PATH_DELETE_OUTCOME_DELETED` or `NOT_PRESENT` for a withdrawal, or the gRPC error with its status name. An answer without one of these outcomes (rustbgpd older than 0.79.0, for example) counts as a failure.
 - Withdrawals set `allow_missing`, so withdrawing a route rustbgpd no longer has succeeds.
 - A call rustbgpd rejects is retried after `rustbgpd_reconcile_interval` seconds, but at most 10 seconds later. A call that fails because rustbgpd is unreachable is retried after 0.5, 1, 2, 4 and 8 seconds, then every 10 seconds (and never later than `rustbgpd_reconcile_interval`), and at once when rustbgpd answers again after a failed liveness probe. A result for a ban state that changed while the call was in progress is ignored, so the newer state is sent without delay.
@@ -137,7 +138,7 @@ Change `match_community` too if you use another community.
 
 ## Leases (experimental)
 
-With `rustbgpd_lease = on` the action uses `AddLeasedPath` instead of `AddPath`, all under one owner (`rustbgpd_lease_owner`), and renews the lease every third of `rustbgpd_lease_time`. If FastNetMon stops renewing, rustbgpd withdraws all of the owner's bans when the lease expires. When rustbgpd refuses a renewal, or answers an announce with a new lease generation, the action announces all wanted routes again under the new lease.
+With `rustbgpd_lease = on` the action uses `AddLeasedPath` instead of `AddPath`, all under one owner (`rustbgpd_lease_owner`), and renews the lease every third of `rustbgpd_lease_time`, checking before every call. Each call ends at least one second before the lease would expire. If FastNetMon stops renewing, rustbgpd withdraws all of the owner's bans when the lease expires. When rustbgpd refuses a renewal, or answers an announce with a new lease generation, the action announces all wanted routes again under the new lease.
 
 The lease calls (`AddLeasedPath`, `RenewLease`) are not part of rustbgpd's stable v1 API in rustbgpd 0.79.0 and may change in later releases.
 
