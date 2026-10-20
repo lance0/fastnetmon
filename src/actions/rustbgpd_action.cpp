@@ -795,7 +795,7 @@ bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
 
     if (fd < 0) {
         logger << log4cpp::Priority::ERROR << "Cannot open rustbgpd_token_file " << path << ": " << strerror(errno)
-               << (errno == ELOOP ? " (symbolic links are not allowed)" : "");
+               << (errno == ELOOP || errno == EMLINK ? " (symbolic links are not allowed)" : "");
         return false;
     }
 
@@ -1056,8 +1056,10 @@ void rustbgpd_ban_manage(const std::string& action,
     // FastNetMon adds host to its ban list and may write attack details to disk before it calls us, and nothing
     // keeps these steps together with unban. Unban removes host from ban list before it calls actions (API) or
     // shortly after (unban of expired bans). Ban which reaches us after host left ban list was overtaken by its unban
-    // and must not announce anything. We check under our lock, so unban which removes host after this check waits
-    // for us and is applied after this ban
+    // and must not announce anything. We check while we hold our lock. Removing host from ban list does not take our
+    // lock, but unban's own call of this function does: if host leaves ban list after this check, that call waits
+    // for us and withdraws what this ban announced. We read FastNetMon's ban list because it is the only record
+    // which both ban and unban paths change before they call actions
     bool still_banned = ipv6 ? ban_list_ipv6.is_blackholed(client_ipv6) : ban_list_ipv4.is_blackholed(client_ip);
 
     if (action == "ban" && !still_banned) {

@@ -2206,8 +2206,7 @@ void interruption_signal_handler(int signal_number) {
 
 #ifdef ENABLE_RUSTBGPD
     if (fastnetmon_global_configuration.rustbgpd) {
-        logger << log4cpp::Priority::INFO << "Stop rustbgpd action";
-
+        // No logging here: it would take a lock
         if (!rustbgpd_action_signal_shutdown()) {
             // Its worker still runs and exit() would destroy objects it uses. We leave at once with status 2.
             // No message: even write() may block here when stderr is a full pipe
