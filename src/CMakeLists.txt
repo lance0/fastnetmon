@@ -811,12 +811,12 @@ if (ENABLE_GOBGP_SUPPORT)
             target_link_libraries(rustbgpd_client_grpc_pb_cc gRPC::grpc gRPC::grpc++)
             target_link_libraries(rustbgpd_action gRPC::grpc gRPC::grpc++)
         else()
-            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GRPC_PATH})
-            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GPR_PATH})
-            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GRPC_CPP_PATH})
+            target_link_libraries(rustbgpd_client_grpc_pb_cc ${GRPC_LIBRARY_GRPC_CPP_PATH} ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH})
+            target_link_libraries(rustbgpd_action ${GRPC_LIBRARY_GRPC_CPP_PATH} ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH})
         endif()
 
         if (LINK_WITH_ABSL)
+            target_link_libraries(rustbgpd_client_grpc_pb_cc absl::base absl::synchronization)
             target_link_libraries(rustbgpd_action absl::base absl::synchronization)
         endif()
 
@@ -1199,6 +1199,13 @@ if (BUILD_TESTS)
 
     add_executable(patricia_performance_tests tests/patricia_performance_tests.cpp)
     target_link_libraries(patricia_performance_tests patricia fast_library ${LOG4CPP_LIBRARY_PATH})
+
+    if (ENABLE_GOBGP_SUPPORT AND ENABLE_RUSTBGPD_SUPPORT)
+        # rustbgpd action against in-process mock of rustbgpd's gRPC API
+        add_executable(rustbgpd_action_tests tests/rustbgpd_action_tests.cpp)
+        target_link_libraries(rustbgpd_action_tests rustbgpd_action bgp_protocol fast_library ${LOG4CPP_LIBRARY_PATH})
+        target_link_libraries(rustbgpd_action_tests ${Boost_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${GTEST_LIBRARY_PATH})
+    endif()
 endif()
 
 # Check default values prepared by CMAKE for us
