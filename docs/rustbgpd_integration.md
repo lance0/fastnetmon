@@ -132,7 +132,7 @@ Change `match_community` too if you use another community.
   - when rustbgpd starts a new lease generation, if leases are on;
   - every `rustbgpd_reconcile_interval` seconds.
 - On a planned rustbgpd restart, BGP peers with Graceful Restart keep the blackholes as stale routes. rustbgpd sends End-of-RIB soon after the session comes back, and the action announces the bans again shortly after rustbgpd's API answers. A short gap between the two is possible, so a peer may drop a blackhole for a moment. A restart faster than one probe interval is caught by the periodic pass instead.
-- On SIGINT, FastNetMon's signal handler asks the worker to stop and waits up to the call deadline (5 seconds) for it to finish its current call; it does not lock or join anything in the handler. The worker thread, named `rustbgpd`, blocks all signals, so the handler never runs on it.
+- On SIGINT, FastNetMon's signal handler asks the worker to stop and waits up to 6 seconds (the 5 second call deadline plus one second) for it to finish its current call; it does not lock or join anything in the handler. If the worker has not finished by then, FastNetMon prints `rustbgpd action did not stop in time, exiting without cleanup` to standard error and exits at once with status 1, without running exit handlers. The worker thread, named `rustbgpd` where the platform supports thread names, blocks SIGINT, so the handler never runs on it.
 - Ban lists are not persistent in FastNetMon either. If FastNetMon stops, its bans stay in rustbgpd until they are withdrawn by hand (`rbgp rib delete <prefix>`) or until rustbgpd restarts, unless leases are on.
 
 ## Leases (experimental)
