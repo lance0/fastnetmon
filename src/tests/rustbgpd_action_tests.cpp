@@ -113,11 +113,40 @@ class mock_state_t {
 
     std::atomic<int> liveness_code{ grpc::StatusCode::OK };
 
-    bool lease_live      = false;
+    bool lease_live = false;
+    std::chrono::steady_clock::time_point lease_deadline{};
+
+    // Lease expired at least once
+    std::atomic<bool> lease_expired{ false };
+
+    std::atomic<int> delete_delay_ms{ 0 };
+
+    // Longest time to deadline seen on withdrawals, in milliseconds
+    std::atomic<long> longest_delete_deadline_ms{ 0 };
     uint64_t incarnation = 7;
     uint64_t sequence    = 1;
 
     std::string last_authorization;
+
+    // Expires lease as rustbgpd does when its deadline passed: drops owned routes
+    void expire_if_due() {
+        std::lock_guard<std::mutex> lock_guard(mutex);
+
+        if (!lease_live || std::chrono::steady_clock::now() < lease_deadline) {
+            return;
+        }
+
+        for (auto it = routes.begin(); it != routes.end();) {
+            if (!owners[it->first].empty()) {
+                it = routes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        lease_live    = false;
+        lease_expired = true;
+    }
 
     bool has(const std::string& key) {
         std::lock_guard<std::mutex> lock_guard(mutex);
@@ -150,6 +179,8 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
     grpc::Status AddLeasedPath(grpc::ServerContext* context,
                                const rustbgpd::v1::AddLeasedPathRequest* request,
                                rustbgpd::v1::AddLeasedPathResponse* response) override {
+        state.expire_if_due();
+
         auto outcome = add(context, request->path(), request->lease().owner());
         set_outcome(response->mutable_result(), outcome);
 
@@ -159,6 +190,9 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
             state.lease_live = true;
             state.sequence++;
         }
+
+        state.lease_deadline = std::max(state.lease_deadline, std::chrono::steady_clock::now() +
+                                                                  std::chrono::seconds(request->lease().lease_seconds()));
 
         if (!state.omit_generation) {
             response->mutable_generation()->set_incarnation(state.incarnation);
@@ -183,6 +217,15 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
     grpc::Status DeletePath(grpc::ServerContext* context,
                             const rustbgpd::v1::DeletePathRequest* request,
                             rustbgpd::v1::DeletePathResponse* response) override {
+        long deadline_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(context->deadline() - std::chrono::system_clock::now())
+                .count();
+        state.longest_delete_deadline_ms = std::max(state.longest_delete_deadline_ms.load(), deadline_ms);
+
+        state.expire_if_due();
+        std::this_thread::sleep_for(std::chrono::milliseconds(state.delete_delay_ms.load()));
+        state.expire_if_due();
+
         state.deletes++;
 
         std::lock_guard<std::mutex> lock_guard(state.mutex);
@@ -205,6 +248,7 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
     grpc::Status RenewLease(grpc::ServerContext* context,
                             const rustbgpd::v1::RenewLeaseRequest* request,
                             rustbgpd::v1::RenewLeaseResponse* response) override {
+        state.expire_if_due();
         state.renewals++;
 
         std::lock_guard<std::mutex> lock_guard(state.mutex);
@@ -214,6 +258,7 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "not the live lease");
         }
 
+        state.lease_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(request->lease_seconds());
         *response->mutable_generation() = request->generation();
         return grpc::Status::OK;
     }
@@ -754,6 +799,52 @@ TEST_F(RustbgpdActionTest, subnet_announce_skipped_without_customer_network) {
     ipv4_action("ban", "203.0.113.8", subnet_cidr_mask_t(0, 24));
     ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.8/32"); }, 3s));
     EXPECT_FALSE(state.has("0.0.0.0/24"));
+}
+
+// Batch of slow withdrawals takes longer than lease: lease must be renewed between them
+TEST_F(RustbgpdActionTest, lease_renewed_during_long_batch) {
+    configuration_map["rustbgpd_lease"]      = "on";
+    configuration_map["rustbgpd_lease_time"] = "6";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    std::vector<std::string> hosts = { "203.0.113.10", "203.0.113.11", "203.0.113.12", "203.0.113.13" };
+
+    ipv4_action("ban", "203.0.113.7");
+
+    for (const auto& host : hosts) {
+        ipv4_action("ban", host);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32") && state.has("203.0.113.13/32"); }, 3s));
+
+    // Four withdrawals of 2.5 seconds each: 10 seconds, lease is 6 seconds
+    state.delete_delay_ms = 2500;
+
+    for (const auto& host : hosts) {
+        ipv4_action("unban", host);
+    }
+
+    EXPECT_TRUE(wait_for([&] { return state.deletes >= 4; }, 20s));
+    EXPECT_FALSE(state.lease_expired) << "lease expired during batch of withdrawals";
+    EXPECT_TRUE(state.has("203.0.113.7/32"));
+}
+
+// With leases call deadline ends one second before lease would expire: 5 second lease, at most 4 seconds per call
+// instead of usual 5
+TEST_F(RustbgpdActionTest, call_deadline_ends_before_lease_expiry) {
+    configuration_map["rustbgpd_lease"]      = "on";
+    configuration_map["rustbgpd_lease_time"] = "5";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.7");
+    ipv4_action("ban", "203.0.113.8");
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.8/32"); }, 3s));
+
+    ipv4_action("unban", "203.0.113.8");
+    ASSERT_TRUE(wait_for([&] { return state.deletes >= 1; }, 3s));
+
+    EXPECT_GT(state.longest_delete_deadline_ms, 0);
+    EXPECT_LE(state.longest_delete_deadline_ms, 4000) << "call may outlive lease";
 }
 
 // Lease expires in the middle of full pass: routes added before we saw new generation must be added again

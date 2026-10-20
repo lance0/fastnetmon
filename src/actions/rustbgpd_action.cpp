@@ -116,6 +116,10 @@ uint64_t rustbgpd_last_version = 0;
 bool rustbgpd_lease_generation_known = false;
 rustbgpd::v1::LeaseGeneration rustbgpd_lease_generation;
 
+// Our lease is valid at least until this time: start of last successful leased add or renewal plus lease time.
+// Used by worker thread only, empty when unknown
+rustbgpd_clock_t::time_point rustbgpd_lease_valid_until{};
+
 // Allocated on start and deleted after join. After stop from signal handler we never join and leave it allocated
 boost::thread* rustbgpd_worker = nullptr;
 bool rustbgpd_worker_running   = false;
@@ -135,7 +139,17 @@ void (*rustbgpd_test_checkpoint)(const char* point) = nullptr;
 grpc::ClientContext* rustbgpd_current_call = nullptr;
 
 void rustbgpd_prepare_context(grpc::ClientContext& context, unsigned int timeout_seconds) {
-    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(timeout_seconds));
+    std::chrono::milliseconds timeout = std::chrono::seconds(timeout_seconds);
+
+    // Call must end one second before our lease would expire, so that we can renew it after the call
+    if (fastnetmon_global_configuration.rustbgpd_lease && rustbgpd_lease_valid_until != rustbgpd_clock_t::time_point{}) {
+        auto until_expiry = std::chrono::duration_cast<std::chrono::milliseconds>(
+            rustbgpd_lease_valid_until - rustbgpd_clock_t::now() - std::chrono::seconds(1));
+
+        timeout = std::max(std::min(timeout, until_expiry), std::chrono::milliseconds(500));
+    }
+
+    context.set_deadline(std::chrono::system_clock::now() + timeout);
 
     // Call credentials are attached only to channels gRPC considers secure, so we add token directly to each call
     if (!rustbgpd_token.empty()) {
@@ -225,8 +239,9 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
         request.mutable_lease()->set_lease_seconds(fastnetmon_global_configuration.rustbgpd_lease_time);
 
         rustbgpd::v1::AddLeasedPathResponse response;
-        status = rustbgpd_run_call(context,
-                                   [&] { return rustbgpd_injection_stub->AddLeasedPath(&context, request, &response); });
+        auto call_started = rustbgpd_clock_t::now();
+        status            = rustbgpd_run_call(context,
+                                              [&] { return rustbgpd_injection_stub->AddLeasedPath(&context, request, &response); });
 
         if (status.ok() && (!response.has_result() || !response.has_generation())) {
             logger << log4cpp::Priority::ERROR << "rustbgpd answered leased announce of " << route.key()
@@ -252,6 +267,7 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
 
             rustbgpd_lease_generation       = generation;
             rustbgpd_lease_generation_known = true;
+            rustbgpd_lease_valid_until = call_started + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time);
         }
     } else {
         rustbgpd::v1::AddPathResponse response;
@@ -342,10 +358,12 @@ void rustbgpd_renew_lease(const rustbgpd::v1::LeaseGeneration& generation) {
     rustbgpd_prepare_context(context, rustbgpd_call_timeout);
 
     rustbgpd::v1::RenewLeaseResponse response;
+    auto call_started = rustbgpd_clock_t::now();
     grpc::Status status =
         rustbgpd_run_call(context, [&] { return rustbgpd_injection_stub->RenewLease(&context, request, &response); });
 
     if (status.ok()) {
+        rustbgpd_lease_valid_until = call_started + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time);
         return;
     }
 
@@ -356,6 +374,7 @@ void rustbgpd_renew_lease(const rustbgpd::v1::LeaseGeneration& generation) {
         // Lease expired or rustbgpd restarted. First leased add will start new lease
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
         rustbgpd_lease_generation_known = false;
+        rustbgpd_lease_valid_until      = rustbgpd_clock_t::time_point{};
         rustbgpd_schedule_full_pass();
     }
 }
@@ -418,6 +437,33 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
     if (state.contributors.empty()) {
         rustbgpd_routes.erase(it);
     }
+}
+
+// Must be called with rustbgpd_mutex held. Returns true with generation to renew when renewal is due
+bool rustbgpd_take_due_renewal(rustbgpd_clock_t::time_point& next_renewal, rustbgpd::v1::LeaseGeneration& generation) {
+    auto now = rustbgpd_clock_t::now();
+
+    if (!fastnetmon_global_configuration.rustbgpd_lease || !rustbgpd_lease_generation_known || now < next_renewal) {
+        return false;
+    }
+
+    next_renewal = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
+
+    bool any_wanted = false;
+
+    for (const auto& [key, state] : rustbgpd_routes) {
+        any_wanted = any_wanted || !state.contributors.empty();
+    }
+
+    if (!any_wanted) {
+        // Nothing to keep, let lease expire
+        rustbgpd_lease_generation_known = false;
+        rustbgpd_lease_valid_until      = rustbgpd_clock_t::time_point{};
+        return false;
+    }
+
+    generation = rustbgpd_lease_generation;
+    return true;
 }
 
 void rustbgpd_worker_thread() {
@@ -486,23 +532,7 @@ void rustbgpd_worker_thread() {
                 next_full_pass = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
             }
 
-            if (fastnetmon_global_configuration.rustbgpd_lease && rustbgpd_lease_generation_known && now >= next_renewal) {
-                bool any_wanted = false;
-
-                for (const auto& [key, state] : rustbgpd_routes) {
-                    any_wanted = any_wanted || !state.contributors.empty();
-                }
-
-                if (any_wanted) {
-                    renew_lease = true;
-                    generation  = rustbgpd_lease_generation;
-                } else {
-                    // Nothing to keep, let lease expire
-                    rustbgpd_lease_generation_known = false;
-                }
-
-                next_renewal = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
-            }
+            renew_lease = rustbgpd_take_due_renewal(next_renewal, generation);
 
             for (const auto& [key, state] : rustbgpd_routes) {
                 if (state.synced_version != state.version && state.retry_after <= now) {
@@ -524,6 +554,16 @@ void rustbgpd_worker_thread() {
         }
 
         for (const auto& [key, job] : jobs) {
+            // Many slow calls in one batch must not let our lease expire
+            {
+                std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+                renew_lease = rustbgpd_take_due_renewal(next_renewal, generation);
+            }
+
+            if (renew_lease) {
+                rustbgpd_renew_lease(generation);
+            }
+
             rustbgpd_call_result_t result = job.announce ? rustbgpd_add_route(job.route) : rustbgpd_delete_route(job.route);
 
             if (rustbgpd_signal_stop) {
@@ -575,6 +615,7 @@ void rustbgpd_action_shutdown() {
 
     rustbgpd_routes.clear();
     rustbgpd_lease_generation_known = false;
+    rustbgpd_lease_valid_until      = rustbgpd_clock_t::time_point{};
     rustbgpd_injection_stub.reset();
     rustbgpd_control_stub.reset();
     rustbgpd_token.clear();
