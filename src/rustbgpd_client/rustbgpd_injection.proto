@@ -7,9 +7,11 @@
 //   https://github.com/lance0/rustbgpd/releases/download/v0.79.0/rustbgpd.proto
 //   SHA-256 21a7f5ca199184a0d4cf94414ed8dcfa49c660c1fbb8b4c79e076b9d7685dd62
 //
-// Package, service, method and message names, field numbers and enum values
-// are kept exactly as upstream, so this file is wire compatible with the full
-// one. Everything the action does not call is left out. To move to another
+// This is a reduced copy. Package, service, method and message names, field
+// numbers and enum values are kept exactly as upstream, so this file is wire
+// compatible with the full one. Services, methods and messages the action does
+// not use are left out, and so are two fields of AddPathRequest it never sets:
+// local_pref (6) and med (7), which are reserved here. To move to another
 // rustbgpd release, compare these definitions with that release's file.
 //
 // AddLeasedPath and RenewLease (injection leases) are outside rustbgpd's v1
@@ -49,8 +51,10 @@ message AddPathRequest {
   string next_hop = 3;
   repeated uint32 as_path = 4;
   uint32 origin = 5;
-  optional uint32 local_pref = 6;
-  optional uint32 med = 7;
+  // local_pref and med are left out: the action does not set them, and they use proto3 optional, which protoc
+  // before 3.15 rejects without a flag
+  reserved 6, 7;
+  reserved "local_pref", "med";
   repeated uint32 communities = 8;
   repeated uint64 extended_communities = 9;
   repeated string large_communities = 10;
