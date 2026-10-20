@@ -123,8 +123,23 @@ void rustbgpd_prepare_context(grpc::ClientContext& context, unsigned int timeout
     }
 }
 
+std::string rustbgpd_status_code_name(grpc::StatusCode code) {
+    static const char* names[] = {
+        "OK",        "CANCELLED",      "UNKNOWN",           "INVALID_ARGUMENT",   "DEADLINE_EXCEEDED",
+        "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION",
+        "ABORTED",   "OUT_OF_RANGE",   "UNIMPLEMENTED",     "INTERNAL",           "UNAVAILABLE",
+        "DATA_LOSS", "UNAUTHENTICATED"
+    };
+
+    if (code >= 0 && size_t(code) < sizeof(names) / sizeof(names[0])) {
+        return names[code];
+    }
+
+    return "code " + std::to_string(code);
+}
+
 std::string rustbgpd_describe_status(const grpc::Status& status) {
-    return "code " + std::to_string(status.error_code()) + ": " + status.error_message();
+    return rustbgpd_status_code_name(status.error_code()) + ": " + status.error_message();
 }
 
 // Errors after which an immediate retry makes sense
@@ -193,6 +208,12 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
         status = rustbgpd_run_call(context,
                                    [&] { return rustbgpd_injection_stub->AddLeasedPath(&context, request, &response); });
 
+        if (status.ok() && (!response.has_result() || !response.has_generation())) {
+            logger << log4cpp::Priority::ERROR << "rustbgpd answered leased announce of " << route.key()
+                   << " without result or lease generation";
+            return rustbgpd_call_result_t::failure;
+        }
+
         if (status.ok()) {
             outcome = response.result().outcome();
 
@@ -233,6 +254,14 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
         return rustbgpd_is_transient_error(status) ? rustbgpd_call_result_t::transient_failure : rustbgpd_call_result_t::failure;
     }
 
+    if (outcome != rustbgpd::v1::PATH_INJECT_OUTCOME_CREATED && outcome != rustbgpd::v1::PATH_INJECT_OUTCOME_REPLACED &&
+        outcome != rustbgpd::v1::PATH_INJECT_OUTCOME_UNCHANGED) {
+        // rustbgpd older than 0.79.0 or newer one with outcome we do not know. We will try again
+        logger << log4cpp::Priority::ERROR << "rustbgpd answered announce of " << route.key()
+               << " without recognised outcome (" << int(outcome) << "), will retry";
+        return rustbgpd_call_result_t::failure;
+    }
+
     logger << log4cpp::Priority::INFO << "rustbgpd announced " << route.key() << " next hop " << route.next_hop
            << " outcome " << rustbgpd::v1::PathInjectOutcome_Name(outcome);
 
@@ -264,6 +293,13 @@ rustbgpd_call_result_t rustbgpd_delete_route(const rustbgpd_route_t& route) {
                << rustbgpd_describe_status(status);
 
         return rustbgpd_is_transient_error(status) ? rustbgpd_call_result_t::transient_failure : rustbgpd_call_result_t::failure;
+    }
+
+    if (response.outcome() != rustbgpd::v1::PATH_DELETE_OUTCOME_DELETED &&
+        response.outcome() != rustbgpd::v1::PATH_DELETE_OUTCOME_NOT_PRESENT) {
+        logger << log4cpp::Priority::ERROR << "rustbgpd answered withdrawal of " << route.key()
+               << " without recognised outcome (" << int(response.outcome()) << "), will retry";
+        return rustbgpd_call_result_t::failure;
     }
 
     logger << log4cpp::Priority::INFO << "rustbgpd withdrew " << route.key() << " outcome "
@@ -326,11 +362,16 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
     auto& state = it->second;
 
     if (result != rustbgpd_call_result_t::success) {
-        // Unreachable rustbgpd: retry on next successful probe. Rejected call: retry on next periodic pass
-        state.retry_after =
-            result == rustbgpd_call_result_t::transient_failure ?
-                rustbgpd_clock_t::now() :
-                rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
+        // Unreachable rustbgpd: retry on next successful probe. Rejected call or answer we do not understand: retry
+        // after rustbgpd_reconcile_interval but not later than in 10 seconds, operator may fix cause in meantime
+        auto retry_delay = std::min(std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval),
+                                    std::chrono::seconds(10));
+
+        state.retry_after = rustbgpd_clock_t::now();
+
+        if (result == rustbgpd_call_result_t::failure) {
+            state.retry_after += retry_delay;
+        }
         return;
     }
 
