@@ -3,10 +3,14 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 
@@ -94,8 +98,9 @@ std::unique_ptr<rustbgpd::v1::ControlService::Stub> rustbgpd_control_stub;
 std::string rustbgpd_token;
 
 // Protects all variables below. Never held during gRPC calls
-std::mutex rustbgpd_mutex;
-std::condition_variable rustbgpd_worker_wakeup;
+// Never destroyed: after stop from signal handler worker may still wait on them while exit() destroys globals
+std::mutex& rustbgpd_mutex                      = *new std::mutex;
+std::condition_variable& rustbgpd_worker_wakeup = *new std::condition_variable;
 
 std::map<std::string, rustbgpd_route_state_t> rustbgpd_routes;
 uint64_t rustbgpd_last_version = 0;
@@ -104,9 +109,14 @@ uint64_t rustbgpd_last_version = 0;
 bool rustbgpd_lease_generation_known = false;
 rustbgpd::v1::LeaseGeneration rustbgpd_lease_generation;
 
-std::thread rustbgpd_worker;
+// Allocated on start and deleted after join. After stop from signal handler we never join and leave it allocated
+std::thread* rustbgpd_worker = nullptr;
 bool rustbgpd_worker_running = false;
 bool rustbgpd_worker_stop    = false;
+
+// Stop requested from signal handler. Lock free, signal handler may only touch these two
+std::atomic<bool> rustbgpd_signal_stop{ false };
+std::atomic<bool> rustbgpd_worker_exited{ true };
 
 // Desired state changed, worker should not wait for next probe interval
 bool rustbgpd_work_pending = false;
@@ -163,7 +173,7 @@ template <typename Call> grpc::Status rustbgpd_run_call(grpc::ClientContext& con
     {
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
-        if (rustbgpd_worker_stop) {
+        if (rustbgpd_worker_stop || rustbgpd_signal_stop) {
             return grpc::Status(grpc::StatusCode::CANCELLED, "FastNetMon is stopping");
         }
 
@@ -388,6 +398,16 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
 }
 
 void rustbgpd_worker_thread() {
+    // Lets signal handler see that we do not use anything anymore
+    class exit_flag_t {
+        public:
+        ~exit_flag_t() {
+            rustbgpd_worker_exited = true;
+        }
+    } exit_flag;
+
+    pthread_setname_np(pthread_self(), "rustbgpd");
+
     bool reachable                    = true;
     grpc::StatusCode last_probe_error = grpc::StatusCode::OK;
 
@@ -398,10 +418,11 @@ void rustbgpd_worker_thread() {
     while (true) {
         {
             std::unique_lock<std::mutex> lock(rustbgpd_mutex);
-            rustbgpd_worker_wakeup.wait_for(lock, rustbgpd_probe_interval,
-                                            [] { return rustbgpd_worker_stop || rustbgpd_work_pending; });
+            rustbgpd_worker_wakeup.wait_for(lock, rustbgpd_probe_interval, [] {
+                return rustbgpd_worker_stop || rustbgpd_signal_stop || rustbgpd_work_pending;
+            });
 
-            if (rustbgpd_worker_stop) {
+            if (rustbgpd_worker_stop || rustbgpd_signal_stop) {
                 return;
             }
 
@@ -409,6 +430,10 @@ void rustbgpd_worker_thread() {
         }
 
         grpc::Status probe = rustbgpd_check_liveness();
+
+        if (rustbgpd_signal_stop) {
+            return;
+        }
 
         if (!probe.ok()) {
             if (reachable || probe.error_code() != last_probe_error) {
@@ -480,6 +505,10 @@ void rustbgpd_worker_thread() {
         for (const auto& [key, job] : jobs) {
             rustbgpd_call_result_t result = job.announce ? rustbgpd_add_route(job.route) : rustbgpd_delete_route(job.route);
 
+            if (rustbgpd_signal_stop) {
+                return;
+            }
+
             std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
             if (rustbgpd_worker_stop) {
@@ -492,6 +521,12 @@ void rustbgpd_worker_thread() {
 }
 
 void rustbgpd_action_shutdown() {
+    // FastNetMon's signal handler calls exit(), which runs us from atexit inside that handler. Signal handler
+    // already stopped worker with rustbgpd_action_signal_shutdown and we must not lock or join here
+    if (rustbgpd_signal_stop) {
+        return;
+    }
+
     {
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
@@ -507,7 +542,10 @@ void rustbgpd_action_shutdown() {
     }
 
     rustbgpd_worker_wakeup.notify_all();
-    rustbgpd_worker.join();
+    rustbgpd_worker->join();
+
+    delete rustbgpd_worker;
+    rustbgpd_worker = nullptr;
 
     std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
@@ -521,6 +559,19 @@ void rustbgpd_action_shutdown() {
     rustbgpd_token.clear();
 
     logger << log4cpp::Priority::INFO << "rustbgpd action stopped";
+}
+
+void rustbgpd_action_signal_shutdown() {
+    // Only async-signal-safe operations: lock free atomics and nanosleep
+    rustbgpd_signal_stop = true;
+
+    // Worker blocks all signals, so we never run on it. It stops before its next call; call in progress ends by its
+    // deadline. If this signal interrupted thread which holds rustbgpd_mutex, worker may wait for that lock forever,
+    // so we wait for limited time only
+    for (unsigned int i = 0; i < (rustbgpd_call_timeout + 1) * 100 && !rustbgpd_worker_exited; i++) {
+        struct timespec delay = { 0, 10 * 1000 * 1000 };
+        nanosleep(&delay, nullptr);
+    }
 }
 
 void rustbgpd_read_bool(const std::string& name, bool& value) {
@@ -821,6 +872,13 @@ bool rustbgpd_action_init() {
     channel_arguments.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 250);
     channel_arguments.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 250);
 
+    // Worker and threads gRPC starts for our channel inherit our signal mask. With all signals blocked
+    // FastNetMon's signal handler never runs on them
+    sigset_t all_signals;
+    sigset_t previous_signals;
+    sigfillset(&all_signals);
+    pthread_sigmask(SIG_BLOCK, &all_signals, &previous_signals);
+
     auto channel = grpc::CreateCustomChannel(grpc_target, grpc::InsecureChannelCredentials(), channel_arguments);
 
     {
@@ -831,8 +889,12 @@ bool rustbgpd_action_init() {
         rustbgpd_control_stub   = rustbgpd::v1::ControlService::NewStub(channel);
 
         rustbgpd_worker_running = true;
-        rustbgpd_worker         = std::thread(rustbgpd_worker_thread);
+        rustbgpd_worker_exited  = false;
+
+        rustbgpd_worker = new std::thread(rustbgpd_worker_thread);
     }
+
+    pthread_sigmask(SIG_SETMASK, &previous_signals, nullptr);
 
     // Stop worker before global variables are destroyed on any exit path
     static bool shutdown_registered = false;

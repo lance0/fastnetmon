@@ -11,6 +11,10 @@ bool rustbgpd_action_init();
 // Stops worker thread. Safe to call more than once
 void rustbgpd_action_shutdown();
 
+// Stops worker from signal handler: only async-signal-safe operations, never locks or joins.
+// Waits up to call deadline for worker to finish. rustbgpd_action_shutdown does nothing after it
+void rustbgpd_action_signal_shutdown();
+
 // Only changes desired state, gRPC calls are made by worker thread. Call it in order of ban and unban events
 void rustbgpd_ban_manage(const std::string& action,
                          bool ipv6,

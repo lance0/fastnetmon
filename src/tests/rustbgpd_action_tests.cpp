@@ -6,7 +6,9 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -56,10 +58,23 @@ class captured_log_t : public log4cpp::LayoutAppender {
         buffer.clear();
     }
 
+    // Raise this signal from inside logging of ban request. Action logs it while it holds its lock
+    std::atomic<int> raise_on_ban_request{ 0 };
+
     protected:
     void _append(const log4cpp::LoggingEvent& event) override {
-        std::lock_guard<std::mutex> lock_guard(mutex);
-        buffer += event.message + "\n";
+        {
+            std::lock_guard<std::mutex> lock_guard(mutex);
+            buffer += event.message + "\n";
+        }
+
+        int signal_number = raise_on_ban_request.exchange(0);
+
+        if (signal_number != 0 && event.message.find("requested by ban") != std::string::npos) {
+            raise(signal_number);
+        } else if (signal_number != 0) {
+            raise_on_ban_request = signal_number;
+        }
     }
 
     private:
@@ -391,6 +406,87 @@ TEST_F(RustbgpdActionTest, exit_without_shutdown_is_clean) {
             ipv4_action("ban", "203.0.113.7");
             wait_for([&] { return state.adds_started == 1; }, 3s);
             exit(0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+// Thread id of action's worker thread, 0 if there is no such thread
+pid_t find_worker_thread() {
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task")) {
+        std::ifstream comm(entry.path() / "comm");
+        std::string name;
+
+        if (std::getline(comm, name) && name == "rustbgpd") {
+            return std::stoi(entry.path().filename());
+        }
+    }
+
+    return 0;
+}
+
+std::atomic<pid_t> worker_thread_id{ 0 };
+
+// Same steps as FastNetMon's interruption_signal_handler, and tells which thread it ran on
+void test_signal_handler(int signal_number) {
+    rustbgpd_action_signal_shutdown();
+    exit(syscall(SYS_gettid) == worker_thread_id ? 3 : 0);
+}
+
+// Signal sent to worker thread must not run handler there: handler would wait for or join the thread it runs on
+TEST_F(RustbgpdActionTest, signal_is_never_handled_on_worker_thread) {
+    EXPECT_EXIT(
+        {
+            // Hang is failure too
+            alarm(20);
+            signal(SIGUSR1, test_signal_handler);
+
+            if (!rustbgpd_action_init()) {
+                exit(2);
+            }
+
+            ipv4_action("ban", "203.0.113.7");
+            wait_for([&] { return state.has("203.0.113.7/32"); }, 3s);
+
+            worker_thread_id = find_worker_thread();
+
+            if (worker_thread_id == 0) {
+                exit(4);
+            }
+
+            syscall(SYS_tgkill, getpid(), worker_thread_id.load(), SIGUSR1);
+            std::this_thread::sleep_for(1s);
+
+            // Worker keeps it pending, so this thread handles it
+            raise(SIGUSR1);
+            std::this_thread::sleep_for(30s);
+            exit(5);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
+
+// Like test_signal_handler, but runs action's atexit function itself and leaves with _exit: our signal is raised
+// inside log4cpp, which still holds its own lock, and log4cpp's teardown in exit() would wait for it
+void test_signal_handler_inside_logging(int signal_number) {
+    rustbgpd_action_signal_shutdown();
+    rustbgpd_action_shutdown();
+    _exit(0);
+}
+
+// Signal handler runs on thread which holds action's lock: shutdown from handler must not lock it again
+TEST_F(RustbgpdActionTest, signal_while_lock_is_held_does_not_deadlock) {
+    EXPECT_EXIT(
+        {
+            alarm(20);
+            signal(SIGUSR1, test_signal_handler_inside_logging);
+
+            if (!rustbgpd_action_init()) {
+                exit(2);
+            }
+
+            captured_log->raise_on_ban_request = SIGUSR1;
+            ipv4_action("ban", "203.0.113.7");
+            std::this_thread::sleep_for(30s);
+            exit(5);
         },
         ::testing::ExitedWithCode(0), "");
 }

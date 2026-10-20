@@ -2206,7 +2206,7 @@ void interruption_signal_handler(int signal_number) {
 #ifdef ENABLE_RUSTBGPD
     if (fastnetmon_global_configuration.rustbgpd) {
         logger << log4cpp::Priority::INFO << "Stop rustbgpd action";
-        rustbgpd_action_shutdown();
+        rustbgpd_action_signal_shutdown();
     }
 #endif
 
