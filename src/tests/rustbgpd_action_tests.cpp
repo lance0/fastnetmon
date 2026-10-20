@@ -626,7 +626,15 @@ TEST_F(RustbgpdActionTest, worker_blocks_only_shutdown_signal) {
     pid_t worker = find_worker_thread();
     ASSERT_NE(worker, 0);
 
-    uint64_t mask = blocked_signals(worker);
+    // New thread runs with all signals blocked until glibc sets mask it inherited, and we may find it by name before
+    uint64_t mask = 0;
+
+    wait_for(
+        [&] {
+            mask = blocked_signals(worker);
+            return !signal_in_mask(mask, SIGSEGV);
+        },
+        5s);
 
     EXPECT_TRUE(signal_in_mask(mask, SIGINT));
 
