@@ -982,9 +982,15 @@ void rustbgpd_ban_manage(const std::string& action,
     } else {
         host = convert_ip_as_uint_to_string(client_ip);
 
-        if (configuration.rustbgpd_announce_whole_subnet) {
-            routes.push_back(rustbgpd_build_route(convert_ip_as_uint_to_string(current_attack.customer_network.subnet_address),
-                                                  current_attack.customer_network.cidr_prefix_length, configuration.rustbgpd_next_hop_subnet_ipv4,
+        const subnet_cidr_mask_t& network = current_attack.customer_network;
+
+        if (configuration.rustbgpd_announce_whole_subnet && (network.cidr_prefix_length == 0 || network.subnet_address == 0)) {
+            // Attack without customer network would make us blackhole default route
+            logger << log4cpp::Priority::ERROR << "rustbgpd will not announce customer subnet "
+                   << convert_ipv4_subnet_to_string(network) << " for " << host << ", attack has no customer network";
+        } else if (configuration.rustbgpd_announce_whole_subnet) {
+            routes.push_back(rustbgpd_build_route(convert_ip_as_uint_to_string(network.subnet_address),
+                                                  network.cidr_prefix_length, configuration.rustbgpd_next_hop_subnet_ipv4,
                                                   configuration.rustbgpd_community_subnet));
         }
 

@@ -318,9 +318,11 @@ class RustbgpdActionTest : public ::testing::Test {
         std::filesystem::remove_all(directory);
     }
 
-    void ipv4_action(const std::string& action, const std::string& host) {
+    void ipv4_action(const std::string& action,
+                     const std::string& host,
+                     subnet_cidr_mask_t customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24)) {
         attack_details_t attack;
-        attack.customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24);
+        attack.customer_network = customer_network;
 
         rustbgpd_ban_manage(action, false, inet_addr(host.c_str()), subnet_ipv6_cidr_mask_t{}, attack);
     }
@@ -693,6 +695,29 @@ TEST_F(RustbgpdActionTest, subnet_withdrawn_after_last_host) {
 
     ipv4_action("unban", "203.0.113.8");
     EXPECT_TRUE(wait_for([&] { return !state.has("203.0.113.0/24") && !state.has("203.0.113.8/32"); }, 3s));
+}
+
+// Ban from FastNetMon's API comes without customer network (0.0.0.0/0): we must not announce it
+TEST_F(RustbgpdActionTest, subnet_announce_skipped_without_customer_network) {
+    configuration_map["rustbgpd_announce_whole_subnet"] = "on";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.7", subnet_cidr_mask_t{});
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+    std::this_thread::sleep_for(500ms);
+
+    {
+        std::lock_guard<std::mutex> lock_guard(state.mutex);
+        EXPECT_EQ(state.routes.size(), 1u) << "announced more than the host route";
+        EXPECT_EQ(state.routes.count("0.0.0.0/0"), 0u) << "announced default route";
+    }
+
+    EXPECT_NE(captured_log->text().find("rustbgpd will not announce customer subnet 0.0.0.0/0 for 203.0.113.7"), std::string::npos);
+
+    // Subnet with unspecified address is refused too
+    ipv4_action("ban", "203.0.113.8", subnet_cidr_mask_t(0, 24));
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.8/32"); }, 3s));
+    EXPECT_FALSE(state.has("0.0.0.0/24"));
 }
 
 // Lease expires in the middle of full pass: routes added before we saw new generation must be added again
