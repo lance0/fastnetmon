@@ -414,6 +414,8 @@ rustbgpd_call_result_t rustbgpd_delete_route(rustbgpd_job_t& job) {
 }
 
 void rustbgpd_renew_lease(const rustbgpd::v1::LeaseGeneration& generation) {
+    rustbgpd_run_test_checkpoint("renewal_started");
+
     rustbgpd::v1::RenewLeaseRequest request;
     request.set_owner(fastnetmon_global_configuration.rustbgpd_lease_owner);
     *request.mutable_generation() = generation;
@@ -833,25 +835,25 @@ void rustbgpd_worker_thread() {
         const rustbgpd_job_t* stalled = nullptr;
 
         for (auto& [key, job] : jobs) {
-            bool outdated = false;
-
             // Many slow calls in one batch must not let our lease expire
             {
                 std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
                 renew_lease = rustbgpd_take_due_renewal(next_renewal, generation);
-
-                // Ban or unban changed this route after we copied the job: its newer version goes in next round,
-                // older one must not reach rustbgpd
-                auto it  = rustbgpd_routes.find(key);
-                outdated = it == rustbgpd_routes.end() || it->second.version != job.version;
             }
 
             if (renew_lease) {
                 rustbgpd_renew_lease(generation);
             }
 
-            if (outdated) {
-                continue;
+            // Ban or unban changed this route after we copied the job: its newer version goes in next round,
+            // older one must not reach rustbgpd. Checked after renewal, which can take a whole call timeout
+            {
+                std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+                auto it = rustbgpd_routes.find(key);
+
+                if (it == rustbgpd_routes.end() || it->second.version != job.version) {
+                    continue;
+                }
             }
 
             rustbgpd_call_result_t result = job.announce ? rustbgpd_add_route(job) : rustbgpd_delete_route(job);

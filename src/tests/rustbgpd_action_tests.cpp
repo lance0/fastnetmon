@@ -132,6 +132,14 @@ class mock_state_t {
         return adds_per_key[key];
     }
 
+    // Withdrawals per route key, under mutex
+    std::map<std::string, int> deletes_per_key;
+
+    int deletes_of(const std::string& key) {
+        std::lock_guard<std::mutex> lock_guard(mutex);
+        return deletes_per_key[key];
+    }
+
     // Longest time to deadline seen on withdrawals, in milliseconds
     std::atomic<long> longest_delete_deadline_ms{ 0 };
     uint64_t incarnation = 7;
@@ -240,6 +248,7 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
         state.deletes++;
 
         std::lock_guard<std::mutex> lock_guard(state.mutex);
+        state.deletes_per_key[route_key(request->prefix(), request->prefix_length())]++;
 
         if (state.routes.erase(route_key(request->prefix(), request->prefix_length())) > 0) {
             response->set_outcome(rustbgpd::v1::PATH_DELETE_OUTCOME_DELETED);
@@ -424,6 +433,7 @@ class RustbgpdActionTest : public ::testing::Test {
 
     void TearDown() override {
         rustbgpd_action_shutdown();
+        rustbgpd_test_checkpoint = nullptr;
         server->Shutdown(std::chrono::system_clock::now() + 1s);
         std::filesystem::remove_all(directory);
     }
@@ -1536,6 +1546,76 @@ TEST_F(RustbgpdActionTest, call_deadline_ends_before_lease_expiry) {
 
     EXPECT_GT(state.longest_delete_deadline_ms, 0);
     EXPECT_LE(state.longest_delete_deadline_ms, 4000) << "call may outlive lease";
+}
+
+// Runs once in worker when lease renewal starts, if set
+std::function<void()> on_renewal_started;
+
+void renewal_checkpoint(const char* point) {
+    if (strcmp(point, "renewal_started") == 0 && on_renewal_started) {
+        auto action        = std::move(on_renewal_started);
+        on_renewal_started = nullptr;
+        action();
+    }
+}
+
+// Renewal between calls can take a whole call timeout. A host banned again during it must not be withdrawn by the
+// job copied before
+TEST_F(RustbgpdActionTest, withdrawal_not_sent_after_reban_during_renewal) {
+    configuration_map["rustbgpd_lease"]      = "on";
+    configuration_map["rustbgpd_lease_time"] = "5";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    std::vector<std::string> hosts = { "203.0.113.10", "203.0.113.11", "203.0.113.12",
+                                       "203.0.113.13", "203.0.113.14", "203.0.113.15" };
+
+    // Stays banned, so lease is kept and renewed
+    ipv4_action("ban", "203.0.113.7");
+
+    for (const auto& host : hosts) {
+        ipv4_action("ban", host);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32") && state.has("203.0.113.15/32"); }, 3s));
+    std::this_thread::sleep_for(300ms);
+
+    // Six withdrawals of 600 ms each against renewal every second: renewal is due between calls of this round
+    state.delete_delay_ms = 600;
+    int deletes_before    = state.deletes;
+
+    for (const auto& host : hosts) {
+        ipv4_action("unban", host);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.deletes > deletes_before; }, 3s));
+
+    // Ban again every host whose withdrawal is still waiting, among them the next job of this round
+    std::vector<std::string> banned_again;
+    std::atomic<bool> renewal_seen{ false };
+
+    on_renewal_started = [&] {
+        for (const auto& host : hosts) {
+            if (state.has(host + "/32")) {
+                ipv4_action("ban", host);
+                banned_again.push_back(host + "/32");
+            }
+        }
+
+        renewal_seen = true;
+    };
+
+    rustbgpd_test_checkpoint = renewal_checkpoint;
+    ASSERT_TRUE(wait_for([&] { return renewal_seen.load(); }, 5s));
+    ASSERT_FALSE(banned_again.empty()) << "renewal came after all withdrawals";
+
+    // Rest of this round and next one
+    std::this_thread::sleep_for(4s);
+    rustbgpd_test_checkpoint = nullptr;
+
+    for (const auto& key : banned_again) {
+        EXPECT_EQ(state.deletes_of(key), 0) << key << " banned again during renewal but withdrawn";
+        EXPECT_TRUE(state.has(key));
+    }
 }
 
 // Lease expires in the middle of full pass: routes added before we saw new generation must be added again
