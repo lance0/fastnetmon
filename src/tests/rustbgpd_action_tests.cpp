@@ -572,6 +572,41 @@ TEST_F(RustbgpdActionTest, older_unban_after_newer_ban_reannounced_by_full_pass)
     EXPECT_NE(captured_log->text().find("rustbgpd announces 203.0.113.7/32 to match FastNetMon ban list"), std::string::npos);
 }
 
+// Full pass builds routes from ban lists with the same announce settings as ban path: no host route when host
+// announce is off, no IPv6 route when IPv6 announce is off, and no subnet from attack without customer network
+TEST_F(RustbgpdActionTest, full_pass_from_ban_lists_respects_announce_settings) {
+    configuration_map["rustbgpd_reconcile_interval"]    = "1";
+    configuration_map["rustbgpd_announce_host"]         = "off";
+    configuration_map["rustbgpd_announce_whole_subnet"] = "on";
+    configuration_map["rustbgpd_announce_host_ipv6"]    = "off";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    // Bans only in ban lists, as after a missed ban call
+    attack_details_t with_network;
+    with_network.customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24);
+    ban_list_ipv4.add_to_blackhole(inet_addr("203.0.113.7"), with_network);
+
+    attack_details_t without_network;
+    ban_list_ipv4.add_to_blackhole(inet_addr("198.51.100.7"), without_network);
+
+    subnet_ipv6_cidr_mask_t ipv6_host;
+    inet_pton(AF_INET6, "2001:db8:66::7", &ipv6_host.subnet_address);
+    ipv6_host.cidr_prefix_length = 128;
+    ban_list_ipv6.add_to_blackhole(ipv6_host, attack_details_t{});
+
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.0/24"); }, 3s));
+    std::this_thread::sleep_for(1500ms);
+
+    std::lock_guard<std::mutex> lock_guard(state.mutex);
+    std::string announced;
+
+    for (const auto& [key, route] : state.routes) {
+        announced += key + " ";
+    }
+
+    EXPECT_EQ(announced, "203.0.113.0/24 ") << "full pass announced routes which announce settings exclude";
+}
+
 // Unban delivered before late ban: route is withdrawn, also when late ban got through
 TEST_F(RustbgpdActionTest, late_ban_after_unban_withdrawn_by_full_pass) {
     configuration_map["rustbgpd_reconcile_interval"] = "1";
