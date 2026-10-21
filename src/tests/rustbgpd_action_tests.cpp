@@ -502,6 +502,57 @@ TEST_F(RustbgpdActionTest, late_ban_after_unban_is_ignored) {
     EXPECT_NE(captured_log->text().find("rustbgpd ignores ban of 203.0.113.7"), std::string::npos);
 }
 
+// Announces which always stall must not keep changed withdrawal waiting
+TEST_F(RustbgpdActionTest, changed_withdrawal_not_starved_by_stalled_announces) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.9");
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.9/32"); }, 3s));
+
+    // Announces of hosts which sort before 203.0.113.9 take 6 seconds against 5 second deadline
+    state.add_delay_ms = 6000;
+    int adds           = state.adds_started;
+
+    for (const auto& host : { "203.0.113.1", "203.0.113.2", "203.0.113.3" }) {
+        ipv4_action("ban", host);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.adds_started > adds; }, 3s));
+    ipv4_action("unban", "203.0.113.9");
+
+    // One stalled call in flight, then the withdrawal
+    EXPECT_TRUE(wait_for([&] { return !state.has("203.0.113.9/32"); }, 7s))
+        << "withdrawal waited behind stalled announces";
+}
+
+// Withdrawals which always stall must not keep changed announce waiting either
+TEST_F(RustbgpdActionTest, changed_announce_not_starved_by_stalled_withdrawals) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    std::vector<std::string> hosts = { "203.0.113.1", "203.0.113.2", "203.0.113.3" };
+
+    for (const auto& host : hosts) {
+        ipv4_action("ban", host);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.3/32"); }, 3s));
+
+    // Withdrawals take 6 seconds against 5 second deadline
+    state.delete_delay_ms = 6000;
+
+    for (const auto& host : hosts) {
+        ipv4_action("unban", host);
+    }
+
+    // First withdrawal is in flight now
+    std::this_thread::sleep_for(1s);
+    ipv4_action("ban", "203.0.113.9");
+
+    // At most two stalled withdrawals, then the announce
+    EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.9/32"); }, 12s))
+        << "announce waited behind stalled withdrawals";
+}
+
 // Records connections to a local port, as HTTP proxy would see them
 class connection_counter_t {
     public:

@@ -93,6 +93,9 @@ class rustbgpd_route_state_t {
 
     // Desired state changed since rustbgpd confirmed it, as opposed to resending in full pass
     bool changed = false;
+
+    // Last call for this route: routes which waited longest go first within their class
+    rustbgpd_clock_t::time_point last_attempt{};
 };
 
 // Copy of route state which worker uses for gRPC call without holding lock
@@ -102,6 +105,7 @@ class rustbgpd_job_t {
     bool announce    = false;
     uint64_t version = 0;
     bool changed     = false;
+    rustbgpd_clock_t::time_point last_attempt{};
 
     // Status of previous failed call for this route: same failure again is logged at DEBUG only
     int last_error = 0;
@@ -440,6 +444,8 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
 
     auto& state = it->second;
 
+    state.last_attempt = rustbgpd_clock_t::now();
+
     // Desired state changed while call was in progress. Worker applies newer version next, result of older one
     // must not delay it, whatever it was
     if (state.version != job.version) {
@@ -520,6 +526,9 @@ void rustbgpd_worker_thread() {
     bool reachable                    = true;
     grpc::StatusCode last_probe_error = grpc::StatusCode::OK;
 
+    // Changed withdrawals go first, unless one of them stalled last round: then changed announces get their turn
+    bool announces_first = false;
+
     auto next_full_pass =
         rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
     auto next_renewal = rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
@@ -588,18 +597,35 @@ void rustbgpd_worker_thread() {
             for (const auto& [key, state] : rustbgpd_routes) {
                 if (state.synced_version != state.version && state.retry_after <= now) {
                     rustbgpd_job_t job;
-                    job.route      = state.route;
-                    job.announce   = !state.contributors.empty();
-                    job.version    = state.version;
-                    job.changed    = state.changed;
-                    job.last_error = state.last_error;
+                    job.route        = state.route;
+                    job.announce     = !state.contributors.empty();
+                    job.version      = state.version;
+                    job.changed      = state.changed;
+                    job.last_error   = state.last_error;
+                    job.last_attempt = state.last_attempt;
 
                     jobs.push_back({ key, job });
                 }
             }
 
-            // Changed bans and unbans go before resending of unchanged routes
-            std::stable_partition(jobs.begin(), jobs.end(), [](const auto& job) { return job.second.changed; });
+            // Changed withdrawals, then changed announces (or the other way round, see announces_first), then
+            // resending of unchanged routes. Within each class route which waited longest goes first, so route which
+            // failed goes to the back. Routes in backoff are not in this list at all
+            auto job_class = [&](const rustbgpd_job_t& job) {
+                if (!job.changed) {
+                    return 2;
+                }
+
+                return job.announce == announces_first ? 0 : 1;
+            };
+
+            std::stable_sort(jobs.begin(), jobs.end(), [&](const auto& a, const auto& b) {
+                if (job_class(a.second) != job_class(b.second)) {
+                    return job_class(a.second) < job_class(b.second);
+                }
+
+                return a.second.last_attempt < b.second.last_attempt;
+            });
 
             // We took all work pending so far, only changes after this point should interrupt this round
             rustbgpd_work_pending = false;
@@ -613,6 +639,7 @@ void rustbgpd_worker_thread() {
         }
 
         unsigned int sent = 0, route_changes = 0, failed = 0;
+        const rustbgpd_job_t* stalled = nullptr;
 
         for (auto& [key, job] : jobs) {
             // Many slow calls in one batch must not let our lease expire
@@ -645,10 +672,18 @@ void rustbgpd_worker_thread() {
 
             // rustbgpd does not answer in time: probe and back off instead of waiting on every other route.
             // New ban or unban: handle it first, rest of this round waits for next one
-            if (result == rustbgpd_call_result_t::transient_failure || rustbgpd_work_pending) {
+            if (result == rustbgpd_call_result_t::transient_failure) {
+                stalled = &job;
+                break;
+            }
+
+            if (rustbgpd_work_pending) {
                 break;
             }
         }
+
+        // Stalled changed withdrawal lets changed announces go first next round, and stalled announce the other way
+        announces_first = stalled != nullptr && stalled->changed && !stalled->announce;
 
         if (full_pass && !jobs.empty()) {
             logger << log4cpp::Priority::INFO << "rustbgpd full pass sent " << sent << " of " << jobs.size()
