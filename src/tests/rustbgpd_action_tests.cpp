@@ -877,6 +877,32 @@ TEST_F(RustbgpdActionTest, repeated_rejection_logged_once) {
     EXPECT_GE(count_lines("DEBUG rustbgpd rejected announce of 203.0.113.7/32"), 1u);
 }
 
+// Many banned hosts in one subnet: every ban must not copy the whole set of hosts which need the subnet route.
+// With such copies 20000 bans take seconds, without them well under one
+TEST_F(RustbgpdActionTest, many_hosts_in_one_subnet_ban_quickly) {
+    configuration_map["rustbgpd_announce_whole_subnet"] = "on";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("10.20.0.0"), 16);
+
+    std::vector<uint32_t> hosts;
+
+    for (int i = 0; i < 20000; i++) {
+        hosts.push_back(htonl((10u << 24) | (20u << 16) | (uint32_t(i / 250 + 1) << 8) | uint32_t(i % 250 + 1)));
+        ban_list_ipv4.add_to_blackhole(hosts.back(), attack);
+    }
+
+    auto started = std::chrono::steady_clock::now();
+
+    for (auto host : hosts) {
+        rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    }
+
+    auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_LT(elapsed, 1s) << "20000 bans took " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << " ms";
+}
+
 // Customer network /32 is the host: host announce with its next hop wins over subnet announce
 TEST_F(RustbgpdActionTest, host_announce_wins_over_subnet_of_same_host) {
     configuration_map["rustbgpd_announce_whole_subnet"] = "on";

@@ -506,12 +506,10 @@ std::vector<rustbgpd_route_t> rustbgpd_routes_for_host(bool ipv6,
                                                        std::string& host,
                                                        bool log_errors);
 
-// Sets contributors of route and starts new version when route becomes wanted or unwanted. Must be called with
-// rustbgpd_mutex held. Returns true when version changed
-bool rustbgpd_set_contributors(rustbgpd_route_state_t& state, const rustbgpd_route_t& route, const std::set<std::string>& contributors) {
-    bool wanted_before = !state.contributors.empty();
-    state.contributors = contributors;
-    bool wanted_now    = !state.contributors.empty();
+// Starts new version after contributors of route changed, when route became wanted or unwanted or is new. Must be
+// called with rustbgpd_mutex held. Returns true when version changed
+bool rustbgpd_contributors_changed(rustbgpd_route_state_t& state, const rustbgpd_route_t& route, bool wanted_before) {
+    bool wanted_now = !state.contributors.empty();
 
     // New entry or change between announce and withdrawal. Unban of route we do not know still sends withdrawal:
     // rustbgpd may keep it from before FastNetMon restart
@@ -527,6 +525,14 @@ bool rustbgpd_set_contributors(rustbgpd_route_state_t& state, const rustbgpd_rou
     state.changed     = true;
 
     return true;
+}
+
+// Sets contributors of route, see rustbgpd_contributors_changed. Must be called with rustbgpd_mutex held
+bool rustbgpd_set_contributors(rustbgpd_route_state_t& state, const rustbgpd_route_t& route, const std::set<std::string>& contributors) {
+    bool wanted_before = !state.contributors.empty();
+    state.contributors = contributors;
+
+    return rustbgpd_contributors_changed(state, route, wanted_before);
 }
 
 // FastNetMon's ban lists are the source of truth: ban and unban calls may reach us in other order than FastNetMon
@@ -798,13 +804,15 @@ void rustbgpd_worker_thread() {
             failed += result != rustbgpd_call_result_t::success;
 
             // rustbgpd does not answer in time: probe and back off instead of waiting on every other route.
-            // New ban or unban: handle it first, rest of this round waits for next one
+            // New ban or unban during resending of unchanged routes: handle it first, rest waits for next round. We
+            // do not stop sending changed routes for it: collecting next round looks at every route, and doing it
+            // for each ban of a burst would cost quadratic time
             if (result == rustbgpd_call_result_t::transient_failure) {
                 stalled = &job;
                 break;
             }
 
-            if (rustbgpd_work_pending) {
+            if (rustbgpd_work_pending && !job.changed) {
                 break;
             }
         }
@@ -1361,15 +1369,16 @@ void rustbgpd_ban_manage(const std::string& action,
     for (const auto& route : routes) {
         auto& state = rustbgpd_routes[route.key()];
 
-        std::set<std::string> contributors = state.contributors;
+        bool wanted_before = !state.contributors.empty();
 
+        // In place: subnet route may have many contributors
         if (action == "ban") {
-            contributors.insert(host);
+            state.contributors.insert(host);
         } else {
-            contributors.erase(host);
+            state.contributors.erase(host);
         }
 
-        rustbgpd_set_contributors(state, route, contributors);
+        rustbgpd_contributors_changed(state, route, wanted_before);
 
         bool wanted_now = !state.contributors.empty();
 
