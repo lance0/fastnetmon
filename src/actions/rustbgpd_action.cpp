@@ -151,8 +151,9 @@ std::atomic<bool> rustbgpd_worker_exited{ true };
 // Desired state changed, worker should not wait for next probe interval
 bool rustbgpd_work_pending = false;
 
-// Counts ban and unban calls, lets full pass notice that ban lists changed while it copied them
-uint64_t rustbgpd_ban_events = 0;
+// Full pass is copying ban lists: hosts with ban or unban calls since copy started go to rustbgpd_hosts_changed_in_copy
+bool rustbgpd_copy_in_progress = false;
+std::set<std::string> rustbgpd_hosts_changed_in_copy;
 
 // Full pass needed because rustbgpd lost our routes (new lease generation), worker also checks ban lists then
 bool rustbgpd_full_pass_requested = false;
@@ -552,14 +553,15 @@ bool rustbgpd_set_contributors(rustbgpd_route_state_t& state, const rustbgpd_rou
 // Lock order: we copy ban lists under their own locks and release them, only then we take rustbgpd_mutex. We never
 // hold both
 void rustbgpd_converge_with_ban_lists() {
-    for (unsigned int attempt = 0; attempt < 3; attempt++) {
-        uint64_t events_before = 0;
+    rustbgpd_run_test_checkpoint("converge_starting");
 
-        {
-            std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
-            events_before = rustbgpd_ban_events;
-        }
+    {
+        std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+        rustbgpd_copy_in_progress = true;
+        rustbgpd_hosts_changed_in_copy.clear();
+    }
 
+    {
         std::map<uint32_t, attack_details_t> banned_ipv4;
         std::map<subnet_ipv6_cidr_mask_t, attack_details_t> banned_ipv6;
 
@@ -588,11 +590,11 @@ void rustbgpd_converge_with_ban_lists() {
 
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
-        // Ban or unban arrived while we copied ban lists: our copy may be older than its change and is never used.
-        // Copy again; when ban lists keep changing we skip this pass and keep marks as they are
-        if (rustbgpd_ban_events != events_before) {
-            continue;
-        }
+        // Ban or unban of a host while we copied ban lists: our copy may be older than its change, so we neither
+        // act on nor mark disagreements of that host. Rest of the copy is used
+        rustbgpd_copy_in_progress                   = false;
+        const std::set<std::string> changed_in_copy = std::move(rustbgpd_hosts_changed_in_copy);
+        rustbgpd_hosts_changed_in_copy.clear();
 
         // Disagreements between our routes and ban lists: host which ban list has and route lacks (+1), or route
         // has and ban list does not (-1)
@@ -624,6 +626,10 @@ void rustbgpd_converge_with_ban_lists() {
         std::map<std::string, std::map<std::string, int>> marks;
 
         for (const auto& [disagreeing_host, key, direction] : disagreements) {
+            if (changed_in_copy.count(disagreeing_host) > 0) {
+                continue;
+            }
+
             auto host_marks = rustbgpd_disagreement_marks.find(disagreeing_host);
 
             bool seen_before = host_marks != rustbgpd_disagreement_marks.end() && host_marks->second.count(key) > 0 &&
@@ -653,8 +659,6 @@ void rustbgpd_converge_with_ban_lists() {
         }
 
         rustbgpd_disagreement_marks = marks;
-
-        return;
     }
 }
 
@@ -1420,8 +1424,9 @@ void rustbgpd_ban_manage(const std::string& action,
     // shortly after (unban of expired bans). Ban which reaches us after host left ban list was overtaken by its unban
     // and must not announce anything. We check while we hold our lock. Removing host from ban list does not take our
     // lock, but unban's own call of this function does: if host leaves ban list after this check, that call waits
-    // for us and withdraws what this ban announced. We read FastNetMon's ban list because it is the only record
-    // which both ban and unban paths change before they call actions
+    // for us and withdraws what this ban announced. We read FastNetMon's ban list because it is FastNetMon's own
+    // record of current bans. It does not order everything: unban of expired bans changes it only after its action
+    // calls, which full passes handle (see rustbgpd_converge_with_ban_lists)
     bool still_banned = ipv6 ? ban_list_ipv6.is_blackholed(client_ipv6) : ban_list_ipv4.is_blackholed(client_ip);
 
     if (action == "ban" && !still_banned) {
@@ -1430,7 +1435,9 @@ void rustbgpd_ban_manage(const std::string& action,
         return;
     }
 
-    rustbgpd_ban_events++;
+    if (rustbgpd_copy_in_progress) {
+        rustbgpd_hosts_changed_in_copy.insert(host);
+    }
 
     // Ban or unban of host is newer than anything full pass saw about it
     rustbgpd_disagreement_marks.erase(host);
