@@ -150,6 +150,12 @@ std::atomic<bool> rustbgpd_worker_exited{ true };
 // Desired state changed, worker should not wait for next probe interval
 bool rustbgpd_work_pending = false;
 
+// Counts ban and unban calls, lets full pass notice that ban lists changed while it copied them
+uint64_t rustbgpd_ban_events = 0;
+
+// Full pass needed because rustbgpd lost our routes (new lease generation), worker also checks ban lists then
+bool rustbgpd_full_pass_requested = false;
+
 // We keep channel to check its state before each liveness probe
 std::shared_ptr<grpc::Channel> rustbgpd_channel;
 
@@ -211,6 +217,12 @@ void rustbgpd_schedule_full_pass() {
 
     rustbgpd_work_pending = true;
     rustbgpd_worker_wakeup.notify_all();
+}
+
+// Must be called with rustbgpd_mutex held
+void rustbgpd_request_full_pass() {
+    rustbgpd_schedule_full_pass();
+    rustbgpd_full_pass_requested = true;
 }
 
 // Runs gRPC call with context which shutdown can cancel
@@ -290,7 +302,7 @@ rustbgpd_call_result_t rustbgpd_add_route(rustbgpd_job_t& job) {
                 // earlier in the current pass, may be gone
                 logger << log4cpp::Priority::WARN << "rustbgpd started new lease for owner "
                        << fastnetmon_global_configuration.rustbgpd_lease_owner << ", will announce all active bans again";
-                rustbgpd_schedule_full_pass();
+                rustbgpd_request_full_pass();
             }
 
             rustbgpd_lease_generation       = generation;
@@ -415,7 +427,7 @@ void rustbgpd_renew_lease(const rustbgpd::v1::LeaseGeneration& generation) {
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
         rustbgpd_lease_generation_known = false;
         rustbgpd_lease_valid_until      = rustbgpd_clock_t::time_point{};
-        rustbgpd_schedule_full_pass();
+        rustbgpd_request_full_pass();
     }
 }
 
@@ -484,6 +496,105 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
 
     if (state.contributors.empty()) {
         rustbgpd_routes.erase(it);
+    }
+}
+
+std::vector<rustbgpd_route_t> rustbgpd_routes_for_host(bool ipv6,
+                                                       uint32_t client_ip,
+                                                       const subnet_ipv6_cidr_mask_t& client_ipv6,
+                                                       const attack_details_t& current_attack,
+                                                       std::string& host,
+                                                       bool log_errors);
+
+// Sets contributors of route and starts new version when route becomes wanted or unwanted. Must be called with
+// rustbgpd_mutex held. Returns true when version changed
+bool rustbgpd_set_contributors(rustbgpd_route_state_t& state, const rustbgpd_route_t& route, const std::set<std::string>& contributors) {
+    bool wanted_before = !state.contributors.empty();
+    state.contributors = contributors;
+    bool wanted_now    = !state.contributors.empty();
+
+    // New entry or change between announce and withdrawal. Unban of route we do not know still sends withdrawal:
+    // rustbgpd may keep it from before FastNetMon restart
+    if (state.version != 0 && wanted_before == wanted_now) {
+        return false;
+    }
+
+    state.route       = route;
+    state.version     = ++rustbgpd_last_version;
+    state.retry_after = rustbgpd_clock_t::time_point{};
+    state.failures    = 0;
+    state.last_error  = 0;
+    state.changed     = true;
+
+    return true;
+}
+
+// FastNetMon's ban lists are the source of truth: ban and unban calls may reach us in other order than FastNetMon
+// changed its ban lists, so on every full pass we make wanted routes match ban lists in both directions.
+// Lock order: we copy ban lists under their own locks and release them, only then we take rustbgpd_mutex. We never
+// hold both
+void rustbgpd_converge_with_ban_lists() {
+    for (unsigned int attempt = 0; attempt < 3; attempt++) {
+        uint64_t events_before = 0;
+
+        {
+            std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+            events_before = rustbgpd_ban_events;
+        }
+
+        std::map<uint32_t, attack_details_t> banned_ipv4;
+        std::map<subnet_ipv6_cidr_mask_t, attack_details_t> banned_ipv6;
+
+        ban_list_ipv4.get_whole_banlist(banned_ipv4);
+        ban_list_ipv6.get_whole_banlist(banned_ipv6);
+
+        // Wanted routes and banned hosts which need them
+        std::map<std::string, std::pair<rustbgpd_route_t, std::set<std::string>>> wanted;
+        std::string host;
+
+        for (const auto& [client_ip, attack] : banned_ipv4) {
+            for (const auto& route : rustbgpd_routes_for_host(false, client_ip, subnet_ipv6_cidr_mask_t{}, attack, host, false)) {
+                wanted[route.key()].first = route;
+                wanted[route.key()].second.insert(host);
+            }
+        }
+
+        for (const auto& [client_ipv6, attack] : banned_ipv6) {
+            for (const auto& route : rustbgpd_routes_for_host(true, 0, client_ipv6, attack, host, false)) {
+                wanted[route.key()].first = route;
+                wanted[route.key()].second.insert(host);
+            }
+        }
+
+        std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+
+        // Ban or unban arrived while we copied ban lists: copy again, our copy may be older than its change
+        if (rustbgpd_ban_events != events_before && attempt < 2) {
+            continue;
+        }
+
+        for (auto& [key, state] : rustbgpd_routes) {
+            auto it = wanted.find(key);
+
+            const std::set<std::string> no_contributors;
+            const auto& contributors = it == wanted.end() ? no_contributors : it->second.second;
+
+            if (state.contributors != contributors &&
+                rustbgpd_set_contributors(state, it == wanted.end() ? state.route : it->second.first, contributors)) {
+                logger << log4cpp::Priority::WARN << "rustbgpd " << (contributors.empty() ? "withdraws " : "announces ")
+                       << key << " to match FastNetMon ban list, ban and unban calls came in other order";
+            }
+        }
+
+        for (const auto& [key, route_and_hosts] : wanted) {
+            if (rustbgpd_routes.count(key) == 0) {
+                rustbgpd_set_contributors(rustbgpd_routes[key], route_and_hosts.first, route_and_hosts.second);
+                logger << log4cpp::Priority::WARN << "rustbgpd announces " << key
+                       << " to match FastNetMon ban list, ban and unban calls came in other order";
+            }
+        }
+
+        return;
     }
 }
 
@@ -572,23 +683,34 @@ void rustbgpd_worker_thread() {
 
         std::vector<std::pair<std::string, rustbgpd_job_t>> jobs;
         bool renew_lease = false;
-        bool full_pass   = false;
+        bool full_pass   = !reachable || rustbgpd_clock_t::now() >= next_full_pass;
         rustbgpd::v1::LeaseGeneration generation;
+
+        {
+            std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
+
+            if (rustbgpd_full_pass_requested) {
+                full_pass                    = true;
+                rustbgpd_full_pass_requested = false;
+            }
+        }
+
+        if (full_pass) {
+            rustbgpd_converge_with_ban_lists();
+        }
 
         {
             std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
             auto now = rustbgpd_clock_t::now();
 
-            if (!reachable) {
-                logger << log4cpp::Priority::INFO << "rustbgpd is reachable, will announce all "
-                       << rustbgpd_routes.size() << " routes again";
+            if (full_pass) {
+                if (!reachable) {
+                    logger << log4cpp::Priority::INFO << "rustbgpd is reachable, will announce all "
+                           << rustbgpd_routes.size() << " routes again";
+                }
+
                 rustbgpd_schedule_full_pass();
-                full_pass = true;
-                next_full_pass = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
-            } else if (now >= next_full_pass) {
-                rustbgpd_schedule_full_pass();
-                full_pass = true;
                 next_full_pass = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
             }
 
@@ -1124,15 +1246,15 @@ rustbgpd_build_route(const std::string& prefix, uint32_t prefix_length, const st
     return route;
 }
 
-void rustbgpd_ban_manage(const std::string& action,
-                         bool ipv6,
-                         uint32_t client_ip,
-                         const subnet_ipv6_cidr_mask_t& client_ipv6,
-                         const attack_details_t& current_attack) {
+std::vector<rustbgpd_route_t> rustbgpd_routes_for_host(bool ipv6,
+                                                       uint32_t client_ip,
+                                                       const subnet_ipv6_cidr_mask_t& client_ipv6,
+                                                       const attack_details_t& current_attack,
+                                                       std::string& host,
+                                                       bool log_errors) {
     const auto& configuration = fastnetmon_global_configuration;
 
     std::vector<rustbgpd_route_t> routes;
-    std::string host;
 
     if (ipv6) {
         char address[INET6_ADDRSTRLEN];
@@ -1150,7 +1272,7 @@ void rustbgpd_ban_manage(const std::string& action,
 
         if (configuration.rustbgpd_announce_whole_subnet && (network.cidr_prefix_length == 0 || network.subnet_address == 0)) {
             // Attack without customer network would make us blackhole default route
-            logger << log4cpp::Priority::ERROR << "rustbgpd will not announce customer subnet "
+            logger << (log_errors ? log4cpp::Priority::ERROR : log4cpp::Priority::DEBUG) << "rustbgpd will not announce customer subnet "
                    << convert_ipv4_subnet_to_string(network) << " for " << host << ", attack has no customer network";
         } else if (configuration.rustbgpd_announce_whole_subnet) {
             routes.push_back(rustbgpd_build_route(convert_ip_as_uint_to_string(network.subnet_address),
@@ -1168,6 +1290,17 @@ void rustbgpd_ban_manage(const std::string& action,
             routes.erase(routes.begin());
         }
     }
+
+    return routes;
+}
+
+void rustbgpd_ban_manage(const std::string& action,
+                         bool ipv6,
+                         uint32_t client_ip,
+                         const subnet_ipv6_cidr_mask_t& client_ipv6,
+                         const attack_details_t& current_attack) {
+    std::string host;
+    std::vector<rustbgpd_route_t> routes = rustbgpd_routes_for_host(ipv6, client_ip, client_ipv6, current_attack, host, true);
 
     std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
@@ -1191,29 +1324,22 @@ void rustbgpd_ban_manage(const std::string& action,
         return;
     }
 
+    rustbgpd_ban_events++;
+
     for (const auto& route : routes) {
         auto& state = rustbgpd_routes[route.key()];
 
-        bool wanted_before = !state.contributors.empty();
+        std::set<std::string> contributors = state.contributors;
 
         if (action == "ban") {
-            state.contributors.insert(host);
+            contributors.insert(host);
         } else {
-            state.contributors.erase(host);
+            contributors.erase(host);
         }
+
+        rustbgpd_set_contributors(state, route, contributors);
 
         bool wanted_now = !state.contributors.empty();
-
-        // New entry or change between announce and withdrawal. Unban of route we do not know
-        // still sends withdrawal: rustbgpd may keep it from before FastNetMon restart
-        if (state.version == 0 || wanted_before != wanted_now) {
-            state.route       = route;
-            state.version     = ++rustbgpd_last_version;
-            state.retry_after = rustbgpd_clock_t::time_point{};
-            state.failures    = 0;
-            state.last_error  = 0;
-            state.changed     = true;
-        }
 
         logger << log4cpp::Priority::INFO << "rustbgpd " << (wanted_now ? "announce" : "withdrawal") << " of "
                << route.key() << " requested by " << action << " of " << host << ", " << state.contributors.size()

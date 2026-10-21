@@ -362,6 +362,21 @@ class RustbgpdActionTest : public ::testing::Test {
         configuration_map["rustbgpd_reconcile_interval"] = "30";
 
         captured_log->clear();
+
+        // Ban lists outlive tests, and full passes announce what they hold
+        std::vector<uint32_t> banned_ipv4;
+        ban_list_ipv4.get_blackholed_hosts(banned_ipv4);
+
+        for (auto host : banned_ipv4) {
+            ban_list_ipv4.remove_from_blackhole(host);
+        }
+
+        std::vector<subnet_ipv6_cidr_mask_t> banned_ipv6;
+        ban_list_ipv6.get_blackholed_hosts(banned_ipv6);
+
+        for (auto host : banned_ipv6) {
+            ban_list_ipv6.remove_from_blackhole(host);
+        }
     }
 
     // Stops mock rustbgpd, forgets its routes as restarted rustbgpd does and starts it again on the same socket
@@ -500,6 +515,79 @@ TEST_F(RustbgpdActionTest, late_ban_after_unban_is_ignored) {
     std::this_thread::sleep_for(1s);
     EXPECT_FALSE(state.has("203.0.113.7/32")) << "late ban announced host which is not banned";
     EXPECT_NE(captured_log->text().find("rustbgpd ignores ban of 203.0.113.7"), std::string::npos);
+}
+
+// Unban of expired ban calls actions before host leaves ban list: delayed ban passes ban list check and announces
+// again. Next full pass compares with ban list and withdraws it
+TEST_F(RustbgpdActionTest, late_ban_in_expiry_window_withdrawn_by_full_pass) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    uint32_t host = inet_addr("203.0.113.7");
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24);
+
+    ban_list_ipv4.add_to_blackhole(host, attack);
+    rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+
+    // Unban of expired bans: actions first
+    rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+
+    // Delayed older ban arrives while host is still in ban list
+    rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+
+    // Then host leaves ban list
+    ban_list_ipv4.remove_from_blackhole(host);
+
+    EXPECT_TRUE(wait_for([&] { return !state.has("203.0.113.7/32"); }, 3s)) << "expired ban stays announced";
+}
+
+// API unban takes host out of ban list, new ban adds it again and announces, then older unban arrives: next full
+// pass compares with ban list and announces again
+TEST_F(RustbgpdActionTest, older_unban_after_newer_ban_reannounced_by_full_pass) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    uint32_t host = inet_addr("203.0.113.7");
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24);
+
+    ban_list_ipv4.add_to_blackhole(host, attack);
+    rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+
+    // API unban removes host, its action call is delayed
+    ban_list_ipv4.remove_from_blackhole(host);
+
+    // New ban of the same host
+    ban_list_ipv4.add_to_blackhole(host, attack);
+    rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+
+    // Delayed unban arrives
+    rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    ASSERT_TRUE(wait_for([&] { return !state.has("203.0.113.7/32"); }, 3s));
+
+    EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s)) << "banned host stays withdrawn";
+    EXPECT_NE(captured_log->text().find("rustbgpd announces 203.0.113.7/32 to match FastNetMon ban list"), std::string::npos);
+}
+
+// Unban delivered before late ban: route is withdrawn, also when late ban got through
+TEST_F(RustbgpdActionTest, late_ban_after_unban_withdrawn_by_full_pass) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    uint32_t host = inet_addr("203.0.113.7");
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24);
+
+    ban_list_ipv4.add_to_blackhole(host, attack);
+    ban_list_ipv4.remove_from_blackhole(host);
+    rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+
+    std::this_thread::sleep_for(2500ms);
+    EXPECT_FALSE(state.has("203.0.113.7/32")) << "host which is not banned stays announced";
 }
 
 // Announces which always stall must not keep changed withdrawal waiting
