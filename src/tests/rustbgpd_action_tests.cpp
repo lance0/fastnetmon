@@ -781,6 +781,18 @@ TEST_F(RustbgpdActionTest, withdrawal_not_stuck_behind_stalled_announces) {
         << "withdrawal waited behind stalled announces";
 }
 
+// New channel starts idle: start is not a reconnect, so no full pass and no reconnect message
+TEST_F(RustbgpdActionTest, start_is_not_reconnect) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.7");
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+    std::this_thread::sleep_for(1s);
+
+    EXPECT_EQ(captured_log->text().find("rustbgpd is reachable, will announce all"), std::string::npos);
+    EXPECT_EQ(captured_log->text().find("rustbgpd full pass sent"), std::string::npos);
+}
+
 // rustbgpd restart shorter than our probe interval and its deadline: connection loss alone must trigger full pass
 TEST_F(RustbgpdActionTest, short_restart_is_detected) {
     ASSERT_TRUE(rustbgpd_action_init());
@@ -1158,7 +1170,7 @@ TEST_F(RustbgpdActionTest, subnet_announce_skipped_without_customer_network) {
 // Batch of slow withdrawals takes longer than lease: lease must be renewed between them
 TEST_F(RustbgpdActionTest, lease_renewed_during_long_batch) {
     configuration_map["rustbgpd_lease"]      = "on";
-    configuration_map["rustbgpd_lease_time"] = "6";
+    configuration_map["rustbgpd_lease_time"] = "10";
     ASSERT_TRUE(rustbgpd_action_init());
 
     std::vector<std::string> hosts = { "203.0.113.10", "203.0.113.11", "203.0.113.12", "203.0.113.13" };
@@ -1171,7 +1183,9 @@ TEST_F(RustbgpdActionTest, lease_renewed_during_long_batch) {
 
     ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32") && state.has("203.0.113.13/32"); }, 3s));
 
-    // Four withdrawals of 2.5 seconds each: 10 seconds, lease is 6 seconds
+    // Four withdrawals of 2.5 seconds each, 10 seconds in total, against 10 second lease renewed every 3 seconds.
+    // Renewal between calls keeps every call within its deadline; without it the last call would be cut short one
+    // second before the lease expires
     state.delete_delay_ms = 2500;
 
     for (const auto& host : hosts) {
@@ -1181,6 +1195,7 @@ TEST_F(RustbgpdActionTest, lease_renewed_during_long_batch) {
     EXPECT_TRUE(wait_for([&] { return state.deletes >= 4; }, 20s));
     EXPECT_FALSE(state.lease_expired) << "lease expired during batch of withdrawals";
     EXPECT_TRUE(state.has("203.0.113.7/32"));
+    EXPECT_EQ(captured_log->text().find("DEADLINE_EXCEEDED"), std::string::npos) << "call cut short by lease deadline";
 }
 
 // With leases call deadline ends one second before lease would expire: 5 second lease, at most 4 seconds per call

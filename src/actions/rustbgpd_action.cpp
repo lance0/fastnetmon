@@ -640,6 +640,9 @@ void rustbgpd_worker_thread() {
     // Changed withdrawals go first, unless one of them stalled last round: then changed announces get their turn
     bool announces_first = false;
 
+    // Channel was ready once. New channel starts idle, which is not reconnect
+    bool was_ready = false;
+
     auto next_full_pass =
         rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
     auto next_renewal = rustbgpd_clock_t::now() + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_lease_time / 3);
@@ -660,7 +663,7 @@ void rustbgpd_worker_thread() {
 
         // Channel which is not ready lost its connection since last probe: rustbgpd may have restarted faster than
         // our probe could fail, so we handle it as reconnect and resend everything
-        if (rustbgpd_channel->GetState(false) != GRPC_CHANNEL_READY) {
+        if (was_ready && rustbgpd_channel->GetState(false) != GRPC_CHANNEL_READY) {
             reachable = false;
         }
 
@@ -680,6 +683,8 @@ void rustbgpd_worker_thread() {
             last_probe_error = probe.error_code();
             continue;
         }
+
+        was_ready = true;
 
         std::vector<std::pair<std::string, rustbgpd_job_t>> jobs;
         bool renew_lease = false;
@@ -705,7 +710,7 @@ void rustbgpd_worker_thread() {
             auto now = rustbgpd_clock_t::now();
 
             if (full_pass) {
-                if (!reachable) {
+                if (!reachable && !rustbgpd_routes.empty()) {
                     logger << log4cpp::Priority::INFO << "rustbgpd is reachable, will announce all "
                            << rustbgpd_routes.size() << " routes again";
                 }
@@ -806,6 +811,12 @@ void rustbgpd_worker_thread() {
 
         // Stalled changed withdrawal lets changed announces go first next round, and stalled announce the other way
         announces_first = stalled != nullptr && stalled->changed && !stalled->announce;
+
+        // Connection may have dropped during this round and the last call may have reconnected to restarted
+        // rustbgpd already, then channel would look ready at next probe. Check it now as well
+        if (rustbgpd_channel->GetState(false) != GRPC_CHANNEL_READY) {
+            reachable = false;
+        }
 
         if (full_pass && !jobs.empty()) {
             logger << log4cpp::Priority::INFO << "rustbgpd full pass sent " << sent << " of " << jobs.size()
