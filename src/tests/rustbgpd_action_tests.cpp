@@ -1295,6 +1295,41 @@ TEST_F(RustbgpdActionTest, rejects_targets_other_than_unix_socket_and_loopback_a
     }
 }
 
+// Numbers must be complete decimal strings: FastNetMon's parser alone reads 1e3 as 1 and 30x as 30
+TEST_F(RustbgpdActionTest, numeric_options_must_be_decimal) {
+    for (std::string name : std::vector<std::string>{ "rustbgpd_reconcile_interval", "rustbgpd_lease_time" }) {
+        for (std::string text : std::vector<std::string>{ "1e3", "30x", " 30", "30 ", "+30", "-5", "3.0", "0x10", "", "99999999999" }) {
+            configuration_map[name] = text;
+            EXPECT_FALSE(rustbgpd_action_init()) << name << " accepted '" << text << "'";
+            rustbgpd_action_shutdown();
+        }
+
+        configuration_map[name] = "30";
+        EXPECT_TRUE(rustbgpd_action_init()) << name << " rejected 30";
+        rustbgpd_action_shutdown();
+        configuration_map.erase(name);
+    }
+}
+
+// Communities must be ASN:value with decimal parts up to 65535: FastNetMon's parser alone reads 65535:0x29a as
+// 65535:0, which is not BLACKHOLE
+TEST_F(RustbgpdActionTest, community_options_must_be_complete) {
+    for (std::string name :
+         std::vector<std::string>{ "rustbgpd_community_host", "rustbgpd_community_subnet", "rustbgpd_community_host_ipv6" }) {
+        for (std::string text : std::vector<std::string>{ "65535:0x29a", "65535:666x", "65535:666:1", "65536:666", "65535:65536",
+                                                          ":666", "65535:", "65535 :666", "65535: 666", "blackhole", "" }) {
+            configuration_map[name] = text;
+            EXPECT_FALSE(rustbgpd_action_init()) << name << " accepted '" << text << "'";
+            rustbgpd_action_shutdown();
+        }
+
+        configuration_map[name] = "65535:666";
+        EXPECT_TRUE(rustbgpd_action_init()) << name << " rejected 65535:666";
+        rustbgpd_action_shutdown();
+        configuration_map.erase(name);
+    }
+}
+
 TEST_F(RustbgpdActionTest, tcp_target_requires_token) {
     configuration_map["rustbgpd_target"] = "127.0.0.1:50051";
     EXPECT_FALSE(rustbgpd_action_init());

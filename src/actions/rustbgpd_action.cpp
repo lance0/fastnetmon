@@ -901,9 +901,13 @@ bool rustbgpd_read_number(const std::string& name, unsigned int& value, unsigned
         return true;
     }
 
-    int parsed = 0;
+    const std::string& text = configuration_map[name];
+    int parsed              = 0;
 
-    if (!convert_string_to_positive_integer_safe(configuration_map[name], parsed) || parsed < int(min) || parsed > int(max)) {
+    // FastNetMon's parser accepts leading number of longer string, as 30 of 30x: we require decimal digits only
+    bool decimal = !text.empty() && text.size() <= 9 && text.find_first_not_of("0123456789") == std::string::npos;
+
+    if (!decimal || !convert_string_to_positive_integer_safe(text, parsed) || parsed < int(min) || parsed > int(max)) {
         logger << log4cpp::Priority::ERROR << name << " must be a number from " << min << " to " << max << ", got "
                << configuration_map[name];
         return false;
@@ -927,12 +931,29 @@ bool rustbgpd_read_next_hop(const std::string& name, std::string& value, int fam
     return true;
 }
 
+// ASN:value with decimal parts from 0 to 65535. FastNetMon's parser would read 65535:0x29a as 65535:0
+bool rustbgpd_valid_community(const std::string& value) {
+    auto colon = value.find(':');
+
+    if (colon == std::string::npos || value.find(':', colon + 1) != std::string::npos) {
+        return false;
+    }
+
+    for (const auto& part : { value.substr(0, colon), value.substr(colon + 1) }) {
+        if (part.empty() || part.size() > 5 || part.find_first_not_of("0123456789") != std::string::npos || std::stoul(part) > 65535) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool rustbgpd_read_community(const std::string& name, std::string& value) {
     rustbgpd_read_string(name, value);
 
     bgp_community_attribute_element_t community;
 
-    if (!read_bgp_community_from_string(value, community)) {
+    if (!rustbgpd_valid_community(value) || !read_bgp_community_from_string(value, community)) {
         logger << log4cpp::Priority::ERROR << "Cannot parse " << name << " as BGP community: " << value;
         return false;
     }
