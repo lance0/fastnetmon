@@ -1023,6 +1023,10 @@ bool rustbgpd_action_init() {
     // Retrying connection to absent Unix socket or closed loopback port is cheap
     // We keep default minimum connect timeout (GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 20 seconds) as it also limits time
     // for HTTP/2 handshake
+    // gRPC sends even literal addresses through proxy from grpc_proxy, https_proxy or http_proxy. Our channel is
+    // plaintext and carries bearer token, it must go to rustbgpd directly
+    channel_arguments.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
+
     channel_arguments.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 250);
     channel_arguments.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 250);
 

@@ -6,7 +6,9 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -498,6 +500,85 @@ TEST_F(RustbgpdActionTest, late_ban_after_unban_is_ignored) {
     std::this_thread::sleep_for(1s);
     EXPECT_FALSE(state.has("203.0.113.7/32")) << "late ban announced host which is not banned";
     EXPECT_NE(captured_log->text().find("rustbgpd ignores ban of 203.0.113.7"), std::string::npos);
+}
+
+// Records connections to a local port, as HTTP proxy would see them
+class connection_counter_t {
+    public:
+    connection_counter_t() {
+        listener = socket(AF_INET, SOCK_STREAM, 0);
+
+        sockaddr_in address{};
+        address.sin_family      = AF_INET;
+        address.sin_addr.s_addr = inet_addr("127.0.0.1");
+        bind(listener, (sockaddr*)&address, sizeof(address));
+        listen(listener, 16);
+
+        socklen_t length = sizeof(address);
+        getsockname(listener, (sockaddr*)&address, &length);
+        port = ntohs(address.sin_port);
+
+        thread = std::thread([this] {
+            while (true) {
+                int connection = accept(listener, nullptr, nullptr);
+
+                if (connection < 0) {
+                    return;
+                }
+
+                connections++;
+                close(connection);
+            }
+        });
+    }
+
+    ~connection_counter_t() {
+        shutdown(listener, SHUT_RDWR);
+        close(listener);
+        thread.join();
+    }
+
+    int listener = -1;
+    int port     = 0;
+    std::atomic<int> connections{ 0 };
+    std::thread thread;
+};
+
+// Proxy from environment must not get our plaintext channel with bearer token
+TEST_F(RustbgpdActionTest, http_proxy_from_environment_is_not_used) {
+    int port = 0;
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(injection.get());
+    builder.RegisterService(control.get());
+
+    server->Shutdown(std::chrono::system_clock::now() + 1s);
+    server = builder.BuildAndStart();
+    ASSERT_TRUE(server);
+
+    connection_counter_t proxy;
+    std::string proxy_url = "http://127.0.0.1:" + std::to_string(proxy.port);
+
+    unsetenv("grpc_proxy");
+    unsetenv("https_proxy");
+    unsetenv("no_proxy");
+    unsetenv("no_grpc_proxy");
+    setenv("http_proxy", proxy_url.c_str(), 1);
+
+    configuration_map["rustbgpd_target"]     = "127.0.0.1:" + std::to_string(port);
+    configuration_map["rustbgpd_token_file"] = write_file("token", "secret-token\n", 0600);
+    bool started                             = rustbgpd_action_init();
+
+    if (started) {
+        ipv4_action("ban", "203.0.113.7");
+        EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+        rustbgpd_action_shutdown();
+    }
+
+    unsetenv("http_proxy");
+
+    ASSERT_TRUE(started);
+    EXPECT_EQ(proxy.connections, 0) << "channel went through proxy from http_proxy";
 }
 
 // Failed answer for announce which is already outdated must not delay withdrawal which replaced it
