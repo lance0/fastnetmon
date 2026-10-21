@@ -4,6 +4,7 @@
 
 #include "../attack_details.hpp"
 
+#include <atomic>
 #include <string>
 
 #include <sys/stat.h>
@@ -19,8 +20,9 @@ void rustbgpd_action_shutdown();
 // which runs in signal handler before it must be async-signal-safe on its own
 bool rustbgpd_action_signal_shutdown();
 
-// Test hook called by action at named points, never set in FastNetMon
-extern void (*rustbgpd_test_checkpoint)(const char* point);
+// Test hook called by action at named points, never set in FastNetMon. Tests change it while worker runs
+using rustbgpd_test_checkpoint_t = void (*)(const char* point);
+extern std::atomic<rustbgpd_test_checkpoint_t> rustbgpd_test_checkpoint;
 
 // Only changes desired state, gRPC calls are made by worker thread. Call it in order of ban and unban events
 void rustbgpd_ban_manage(const std::string& action,

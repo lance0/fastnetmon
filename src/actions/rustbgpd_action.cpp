@@ -165,7 +165,16 @@ std::map<std::string, std::map<std::string, int>> rustbgpd_disagreement_marks;
 std::shared_ptr<grpc::Channel> rustbgpd_channel;
 
 // Test hook, never set in FastNetMon
-void (*rustbgpd_test_checkpoint)(const char* point) = nullptr;
+std::atomic<rustbgpd_test_checkpoint_t> rustbgpd_test_checkpoint{ nullptr };
+
+// Calls test hook if set. We load it once, as test may clear it between check and call
+void rustbgpd_run_test_checkpoint(const char* point) {
+    rustbgpd_test_checkpoint_t checkpoint = rustbgpd_test_checkpoint.load();
+
+    if (checkpoint != nullptr) {
+        checkpoint(point);
+    }
+}
 
 // Call in progress, we cancel it on shutdown
 grpc::ClientContext* rustbgpd_current_call = nullptr;
@@ -323,9 +332,7 @@ rustbgpd_call_result_t rustbgpd_add_route(rustbgpd_job_t& job) {
         }
     }
 
-    if (rustbgpd_test_checkpoint != nullptr) {
-        rustbgpd_test_checkpoint("announce_returned");
-    }
+    rustbgpd_run_test_checkpoint("announce_returned");
 
     if (!status.ok()) {
         job.error = status.error_code();
@@ -559,9 +566,7 @@ void rustbgpd_converge_with_ban_lists() {
         ban_list_ipv4.get_whole_banlist(banned_ipv4);
         ban_list_ipv6.get_whole_banlist(banned_ipv6);
 
-        if (rustbgpd_test_checkpoint != nullptr) {
-            rustbgpd_test_checkpoint("converge_copied");
-        }
+        rustbgpd_run_test_checkpoint("converge_copied");
 
         // Wanted routes and banned hosts which need them
         std::map<std::string, std::pair<rustbgpd_route_t, std::set<std::string>>> wanted;
@@ -1440,9 +1445,7 @@ void rustbgpd_ban_manage(const std::string& action,
                << " banned hosts need it";
     }
 
-    if (rustbgpd_test_checkpoint != nullptr) {
-        rustbgpd_test_checkpoint("ban_manage_locked");
-    }
+    rustbgpd_run_test_checkpoint("ban_manage_locked");
 
     rustbgpd_work_pending = true;
     rustbgpd_worker_wakeup.notify_all();
