@@ -1035,6 +1035,53 @@ TEST_F(RustbgpdActionTest, host_announce_wins_over_subnet_of_same_host) {
     EXPECT_EQ(state.routes.size(), 1u);
 }
 
+// Withdrawals of a round were copied before host is banned again: its outdated withdrawal must not be sent. This
+// is the guard for sending changed routes without interruption during a burst
+TEST_F(RustbgpdActionTest, outdated_withdrawal_not_sent_after_reban) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("10.30.0.0"), 16);
+
+    std::vector<uint32_t> hosts;
+
+    for (uint32_t i = 1; i <= 40; i++) {
+        hosts.push_back(htonl((10u << 24) | (30u << 16) | i));
+        ban_list_ipv4.add_to_blackhole(hosts.back(), attack);
+        rustbgpd_ban_manage("ban", false, hosts.back(), subnet_ipv6_cidr_mask_t{}, attack);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.has("10.30.0.40/32") && state.has("10.30.0.1/32"); }, 3s));
+    std::this_thread::sleep_for(300ms);
+
+    // Withdrawals take 50 ms each, one round handles all 40
+    state.delete_delay_ms = 50;
+    int deletes_before    = state.deletes;
+
+    for (auto host : hosts) {
+        ban_list_ipv4.remove_from_blackhole(host);
+        rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.deletes >= deletes_before + 2; }, 3s));
+
+    // Ban host 30 again while its withdrawal is still waiting in this round
+    uint32_t again = hosts[29];
+    ASSERT_TRUE(state.has("10.30.0.30/32"));
+    ban_list_ipv4.add_to_blackhole(again, attack);
+    rustbgpd_ban_manage("ban", false, again, subnet_ipv6_cidr_mask_t{}, attack);
+
+    bool ever_missing = false;
+    auto end          = std::chrono::steady_clock::now() + 4s;
+
+    while (std::chrono::steady_clock::now() < end) {
+        ever_missing = ever_missing || !state.has("10.30.0.30/32");
+        std::this_thread::sleep_for(1ms);
+    }
+
+    EXPECT_FALSE(ever_missing) << "banned host withdrawn by outdated job of the same round";
+}
+
 // Shutdown cancels call in flight, joins worker and no calls happen after it
 TEST_F(RustbgpdActionTest, shutdown_stops_worker_during_call) {
     ASSERT_TRUE(rustbgpd_action_init());

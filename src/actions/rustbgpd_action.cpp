@@ -829,14 +829,25 @@ void rustbgpd_worker_thread() {
         const rustbgpd_job_t* stalled = nullptr;
 
         for (auto& [key, job] : jobs) {
+            bool outdated = false;
+
             // Many slow calls in one batch must not let our lease expire
             {
                 std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
                 renew_lease = rustbgpd_take_due_renewal(next_renewal, generation);
+
+                // Ban or unban changed this route after we copied the job: its newer version goes in next round,
+                // older one must not reach rustbgpd
+                auto it  = rustbgpd_routes.find(key);
+                outdated = it == rustbgpd_routes.end() || it->second.version != job.version;
             }
 
             if (renew_lease) {
                 rustbgpd_renew_lease(generation);
+            }
+
+            if (outdated) {
+                continue;
             }
 
             rustbgpd_call_result_t result = job.announce ? rustbgpd_add_route(job) : rustbgpd_delete_route(job);
