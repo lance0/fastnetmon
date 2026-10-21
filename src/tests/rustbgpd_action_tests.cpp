@@ -610,6 +610,20 @@ TEST_F(RustbgpdActionTest, repeated_rejection_logged_once) {
     EXPECT_GE(count_lines("DEBUG rustbgpd rejected announce of 203.0.113.7/32"), 1u);
 }
 
+// Customer network /32 is the host: host announce with its next hop wins over subnet announce
+TEST_F(RustbgpdActionTest, host_announce_wins_over_subnet_of_same_host) {
+    configuration_map["rustbgpd_announce_whole_subnet"] = "on";
+    configuration_map["rustbgpd_next_hop_subnet_ipv4"]  = "192.0.2.1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.7", subnet_cidr_mask_t(inet_addr("203.0.113.7"), 32));
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+
+    std::lock_guard<std::mutex> lock_guard(state.mutex);
+    EXPECT_EQ(state.routes["203.0.113.7/32"].next_hop(), "0.0.0.0");
+    EXPECT_EQ(state.routes.size(), 1u);
+}
+
 // Shutdown cancels call in flight, joins worker and no calls happen after it
 TEST_F(RustbgpdActionTest, shutdown_stops_worker_during_call) {
     ASSERT_TRUE(rustbgpd_action_init());

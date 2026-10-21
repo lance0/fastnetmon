@@ -1123,6 +1123,11 @@ void rustbgpd_ban_manage(const std::string& action,
             routes.push_back(rustbgpd_build_route(host, 32, configuration.rustbgpd_next_hop_host_ipv4,
                                                   configuration.rustbgpd_community_host));
         }
+
+        // Customer network /32 is the host itself: one route, host announce with its next hop and community wins
+        if (routes.size() == 2 && routes[0].key() == routes[1].key()) {
+            routes.erase(routes.begin());
+        }
     }
 
     std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
