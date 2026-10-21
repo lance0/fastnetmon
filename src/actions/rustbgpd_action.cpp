@@ -20,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <tuple>
 
 #include <grpcpp/grpcpp.h>
 
@@ -155,6 +156,10 @@ uint64_t rustbgpd_ban_events = 0;
 
 // Full pass needed because rustbgpd lost our routes (new lease generation), worker also checks ban lists then
 bool rustbgpd_full_pass_requested = false;
+
+// Disagreements with ban lists which last full pass saw: host, then route key, then +1 when ban list has host and
+// route does not, -1 for the other way round
+std::map<std::string, std::map<std::string, int>> rustbgpd_disagreement_marks;
 
 // We keep channel to check its state before each liveness probe
 std::shared_ptr<grpc::Channel> rustbgpd_channel;
@@ -554,6 +559,10 @@ void rustbgpd_converge_with_ban_lists() {
         ban_list_ipv4.get_whole_banlist(banned_ipv4);
         ban_list_ipv6.get_whole_banlist(banned_ipv6);
 
+        if (rustbgpd_test_checkpoint != nullptr) {
+            rustbgpd_test_checkpoint("converge_copied");
+        }
+
         // Wanted routes and banned hosts which need them
         std::map<std::string, std::pair<rustbgpd_route_t, std::set<std::string>>> wanted;
         std::string host;
@@ -574,31 +583,71 @@ void rustbgpd_converge_with_ban_lists() {
 
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
-        // Ban or unban arrived while we copied ban lists: copy again, our copy may be older than its change
-        if (rustbgpd_ban_events != events_before && attempt < 2) {
+        // Ban or unban arrived while we copied ban lists: our copy may be older than its change and is never used.
+        // Copy again; when ban lists keep changing we skip this pass and keep marks as they are
+        if (rustbgpd_ban_events != events_before) {
             continue;
         }
 
-        for (auto& [key, state] : rustbgpd_routes) {
+        // Disagreements between our routes and ban lists: host which ban list has and route lacks (+1), or route
+        // has and ban list does not (-1)
+        std::vector<std::tuple<std::string, std::string, int>> disagreements;
+
+        for (const auto& [key, state] : rustbgpd_routes) {
             auto it = wanted.find(key);
 
-            const std::set<std::string> no_contributors;
-            const auto& contributors = it == wanted.end() ? no_contributors : it->second.second;
-
-            if (state.contributors != contributors &&
-                rustbgpd_set_contributors(state, it == wanted.end() ? state.route : it->second.first, contributors)) {
-                logger << log4cpp::Priority::WARN << "rustbgpd " << (contributors.empty() ? "withdraws " : "announces ")
-                       << key << " to match FastNetMon ban list, ban and unban calls came in other order";
+            for (const auto& contributor : state.contributors) {
+                if (it == wanted.end() || it->second.second.count(contributor) == 0) {
+                    disagreements.push_back({ contributor, key, -1 });
+                }
             }
         }
 
         for (const auto& [key, route_and_hosts] : wanted) {
-            if (rustbgpd_routes.count(key) == 0) {
-                rustbgpd_set_contributors(rustbgpd_routes[key], route_and_hosts.first, route_and_hosts.second);
-                logger << log4cpp::Priority::WARN << "rustbgpd announces " << key
-                       << " to match FastNetMon ban list, ban and unban calls came in other order";
+            auto it = rustbgpd_routes.find(key);
+
+            for (const auto& banned_host : route_and_hosts.second) {
+                if (it == rustbgpd_routes.end() || it->second.contributors.count(banned_host) == 0) {
+                    disagreements.push_back({ banned_host, key, +1 });
+                }
             }
         }
+
+        // We act only on disagreement which previous full pass saw too and no ban or unban of that host touched since.
+        // Single pass may fall between ban list change and its action call, as unban of expired bans calls actions
+        // before it removes hosts from ban list. Agreements drop their marks
+        std::map<std::string, std::map<std::string, int>> marks;
+
+        for (const auto& [disagreeing_host, key, direction] : disagreements) {
+            auto host_marks = rustbgpd_disagreement_marks.find(disagreeing_host);
+
+            bool seen_before = host_marks != rustbgpd_disagreement_marks.end() && host_marks->second.count(key) > 0 &&
+                               host_marks->second.at(key) == direction;
+
+            if (!seen_before) {
+                marks[disagreeing_host][key] = direction;
+                continue;
+            }
+
+            auto& state        = rustbgpd_routes[key];
+            bool wanted_before = !state.contributors.empty();
+
+            if (direction > 0) {
+                state.contributors.insert(disagreeing_host);
+            } else {
+                state.contributors.erase(disagreeing_host);
+            }
+
+            const rustbgpd_route_t& route = direction > 0 ? wanted[key].first : state.route;
+
+            if (rustbgpd_contributors_changed(state, route, wanted_before)) {
+                logger << log4cpp::Priority::WARN << "rustbgpd " << (direction > 0 ? "announces " : "withdraws ") << key
+                       << " because FastNetMon ban list " << (direction > 0 ? "had " : "did not have ")
+                       << disagreeing_host << " in two full passes in a row";
+            }
+        }
+
+        rustbgpd_disagreement_marks = marks;
 
         return;
     }
@@ -867,6 +916,7 @@ void rustbgpd_action_shutdown() {
     rustbgpd_worker_stop    = false;
 
     rustbgpd_routes.clear();
+    rustbgpd_disagreement_marks.clear();
     rustbgpd_lease_generation_known = false;
     rustbgpd_lease_valid_until      = rustbgpd_clock_t::time_point{};
     rustbgpd_injection_stub.reset();
@@ -1365,6 +1415,9 @@ void rustbgpd_ban_manage(const std::string& action,
     }
 
     rustbgpd_ban_events++;
+
+    // Ban or unban of host is newer than anything full pass saw about it
+    rustbgpd_disagreement_marks.erase(host);
 
     for (const auto& route : routes) {
         auto& state = rustbgpd_routes[route.key()];

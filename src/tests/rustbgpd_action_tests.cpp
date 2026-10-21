@@ -124,6 +124,14 @@ class mock_state_t {
 
     std::atomic<int> delete_delay_ms{ 0 };
 
+    // Announces per route key, under mutex
+    std::map<std::string, int> adds_per_key;
+
+    int adds_of(const std::string& key) {
+        std::lock_guard<std::mutex> lock_guard(mutex);
+        return adds_per_key[key];
+    }
+
     // Longest time to deadline seen on withdrawals, in milliseconds
     std::atomic<long> longest_delete_deadline_ms{ 0 };
     uint64_t incarnation = 7;
@@ -289,6 +297,7 @@ class mock_injection_t final : public rustbgpd::v1::InjectionService::Service {
         bool existed = state.routes.count(key) > 0;
 
         state.routes[key] = request;
+        state.adds_per_key[key]++;
         state.owners[key] = owner;
 
         return existed ? rustbgpd::v1::PATH_INJECT_OUTCOME_UNCHANGED : rustbgpd::v1::PATH_INJECT_OUTCOME_CREATED;
@@ -540,7 +549,8 @@ TEST_F(RustbgpdActionTest, late_ban_in_expiry_window_withdrawn_by_full_pass) {
     // Then host leaves ban list
     ban_list_ipv4.remove_from_blackhole(host);
 
-    EXPECT_TRUE(wait_for([&] { return !state.has("203.0.113.7/32"); }, 3s)) << "expired ban stays announced";
+    // Second full pass after the disagreement acts on it
+    EXPECT_TRUE(wait_for([&] { return !state.has("203.0.113.7/32"); }, 4s)) << "expired ban stays announced";
 }
 
 // API unban takes host out of ban list, new ban adds it again and announces, then older unban arrives: next full
@@ -568,8 +578,10 @@ TEST_F(RustbgpdActionTest, older_unban_after_newer_ban_reannounced_by_full_pass)
     rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
     ASSERT_TRUE(wait_for([&] { return !state.has("203.0.113.7/32"); }, 3s));
 
-    EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s)) << "banned host stays withdrawn";
-    EXPECT_NE(captured_log->text().find("rustbgpd announces 203.0.113.7/32 to match FastNetMon ban list"), std::string::npos);
+    EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 4s)) << "banned host stays withdrawn";
+    EXPECT_NE(captured_log->text().find(
+                  "rustbgpd announces 203.0.113.7/32 because FastNetMon ban list had 203.0.113.7"),
+              std::string::npos);
 }
 
 // Full pass builds routes from ban lists with the same announce settings as ban path: no host route when host
@@ -594,7 +606,7 @@ TEST_F(RustbgpdActionTest, full_pass_from_ban_lists_respects_announce_settings) 
     ipv6_host.cidr_prefix_length = 128;
     ban_list_ipv6.add_to_blackhole(ipv6_host, attack_details_t{});
 
-    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.0/24"); }, 3s));
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.0/24"); }, 4s));
     std::this_thread::sleep_for(1500ms);
 
     std::lock_guard<std::mutex> lock_guard(state.mutex);
@@ -605,6 +617,112 @@ TEST_F(RustbgpdActionTest, full_pass_from_ban_lists_respects_announce_settings) 
     }
 
     EXPECT_EQ(announced, "203.0.113.0/24 ") << "full pass announced routes which announce settings exclude";
+}
+
+// Ban lists change on every copy of a full pass, last time by unban of our host: full pass must not use its stale
+// copy, which still has the host, and must not announce it again
+std::atomic<int> converge_copies{ -1 };
+
+void converge_checkpoint(const char* point) {
+    if (strcmp(point, "converge_copied") != 0 || converge_copies < 0) {
+        return;
+    }
+
+    int copy = ++converge_copies;
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("198.51.100.0"), 24);
+
+    if (copy <= 2) {
+        // Other host is banned and unbanned in between
+        uint32_t other = inet_addr("198.51.100.1");
+        ban_list_ipv4.add_to_blackhole(other, attack);
+        rustbgpd_ban_manage("ban", false, other, subnet_ipv6_cidr_mask_t{}, attack);
+        ban_list_ipv4.remove_from_blackhole(other);
+        rustbgpd_ban_manage("unban", false, other, subnet_ipv6_cidr_mask_t{}, attack);
+    } else if (copy == 3) {
+        // API unban of our host lands between last copy and its use
+        uint32_t host = inet_addr("203.0.113.7");
+        ban_list_ipv4.remove_from_blackhole(host);
+        rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    }
+}
+
+TEST_F(RustbgpdActionTest, full_pass_never_uses_stale_ban_list_copy) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.7");
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+
+    rustbgpd_test_checkpoint = converge_checkpoint;
+    converge_copies          = 0;
+
+    ASSERT_TRUE(wait_for([&] { return converge_copies >= 4; }, 4s));
+    std::this_thread::sleep_for(1500ms);
+    rustbgpd_test_checkpoint = nullptr;
+
+    EXPECT_FALSE(state.has("203.0.113.7/32")) << "unbanned host announced again from stale ban list copy";
+    EXPECT_EQ(captured_log->text().find(
+                  "rustbgpd announces 203.0.113.7/32 because FastNetMon ban list had 203.0.113.7"),
+              std::string::npos);
+}
+
+// Unban of expired bans calls actions before it removes hosts from ban list: full pass which copies ban list in
+// that window must not announce host again
+TEST_F(RustbgpdActionTest, unban_before_ban_list_removal_never_reannounces) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    uint32_t host = inet_addr("203.0.113.7");
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("203.0.113.0"), 24);
+
+    ban_list_ipv4.add_to_blackhole(host, attack);
+    rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+
+    int adds = state.adds_of("203.0.113.7/32");
+    rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+
+    // At least one full pass runs while host is still in ban list
+    std::this_thread::sleep_for(1500ms);
+    ban_list_ipv4.remove_from_blackhole(host);
+    std::this_thread::sleep_for(2500ms);
+
+    EXPECT_EQ(state.adds_of("203.0.113.7/32"), adds) << "unbanned host announced again";
+    EXPECT_FALSE(state.has("203.0.113.7/32"));
+}
+
+// Bans keep coming while full passes copy ban lists: no ban may be withdrawn
+TEST_F(RustbgpdActionTest, ban_churn_during_full_passes_withdraws_nothing) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    attack_details_t attack;
+    attack.customer_network = subnet_cidr_mask_t(inet_addr("10.0.0.0"), 8);
+
+    auto ban = [&](uint32_t index) {
+        uint32_t host = htonl((10u << 24) | index);
+        ban_list_ipv4.add_to_blackhole(host, attack);
+        rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
+    };
+
+    uint32_t index = 1;
+
+    for (; index <= 5000; index++) {
+        ban(index);
+    }
+
+    // Unique new bans for 5 seconds, several full passes
+    auto end = std::chrono::steady_clock::now() + 5s;
+
+    while (std::chrono::steady_clock::now() < end) {
+        ban(index++);
+        std::this_thread::sleep_for(1ms);
+    }
+
+    std::this_thread::sleep_for(2500ms);
+    EXPECT_EQ(state.deletes, 0) << "live bans withdrawn while ban lists changed";
 }
 
 // Unban delivered before late ban: route is withdrawn, also when late ban got through
@@ -621,7 +739,7 @@ TEST_F(RustbgpdActionTest, late_ban_after_unban_withdrawn_by_full_pass) {
     rustbgpd_ban_manage("unban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
     rustbgpd_ban_manage("ban", false, host, subnet_ipv6_cidr_mask_t{}, attack);
 
-    std::this_thread::sleep_for(2500ms);
+    std::this_thread::sleep_for(3500ms);
     EXPECT_FALSE(state.has("203.0.113.7/32")) << "host which is not banned stays announced";
 }
 
