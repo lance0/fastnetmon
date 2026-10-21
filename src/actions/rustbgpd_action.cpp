@@ -87,6 +87,12 @@ class rustbgpd_route_state_t {
 
     // Failed calls in a row for current version
     unsigned int failures = 0;
+
+    // Status of last failed call, -1 for answer we did not recognise, 0 if last call succeeded
+    int last_error = 0;
+
+    // Desired state changed since rustbgpd confirmed it, as opposed to resending in full pass
+    bool changed = false;
 };
 
 // Copy of route state which worker uses for gRPC call without holding lock
@@ -95,6 +101,14 @@ class rustbgpd_job_t {
     rustbgpd_route_t route;
     bool announce    = false;
     uint64_t version = 0;
+    bool changed     = false;
+
+    // Status of previous failed call for this route: same failure again is logged at DEBUG only
+    int last_error = 0;
+
+    // Set by call: status of this call when it failed and whether rustbgpd changed its routes
+    int error          = 0;
+    bool route_changed = false;
 };
 
 enum class rustbgpd_call_result_t { success, transient_failure, failure };
@@ -131,6 +145,9 @@ std::atomic<bool> rustbgpd_worker_exited{ true };
 
 // Desired state changed, worker should not wait for next probe interval
 bool rustbgpd_work_pending = false;
+
+// We keep channel to check its state before each liveness probe
+std::shared_ptr<grpc::Channel> rustbgpd_channel;
 
 // Test hook, never set in FastNetMon
 void (*rustbgpd_test_checkpoint)(const char* point) = nullptr;
@@ -212,7 +229,13 @@ template <typename Call> grpc::Status rustbgpd_run_call(grpc::ClientContext& con
     return status;
 }
 
-rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
+// Same failure as previous call for this route is logged at DEBUG, first one at ERROR
+log4cpp::Priority::Value rustbgpd_error_priority(const rustbgpd_job_t& job) {
+    return job.error == job.last_error ? log4cpp::Priority::DEBUG : log4cpp::Priority::ERROR;
+}
+
+rustbgpd_call_result_t rustbgpd_add_route(rustbgpd_job_t& job) {
+    const rustbgpd_route_t& route = job.route;
     rustbgpd::v1::AddPathRequest path;
 
     path.set_prefix(route.prefix);
@@ -244,7 +267,8 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
                                               [&] { return rustbgpd_injection_stub->AddLeasedPath(&context, request, &response); });
 
         if (status.ok() && (!response.has_result() || !response.has_generation())) {
-            logger << log4cpp::Priority::ERROR << "rustbgpd answered leased announce of " << route.key()
+            job.error = -1;
+            logger << rustbgpd_error_priority(job) << "rustbgpd answered leased announce of " << route.key()
                    << " without result or lease generation";
             return rustbgpd_call_result_t::failure;
         }
@@ -283,11 +307,13 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
     }
 
     if (!status.ok()) {
-        logger << log4cpp::Priority::ERROR << "rustbgpd rejected announce of " << route.key() << " next hop "
+        job.error = status.error_code();
+
+        logger << rustbgpd_error_priority(job) << "rustbgpd rejected announce of " << route.key() << " next hop "
                << route.next_hop << ": " << rustbgpd_describe_status(status);
 
         if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {
-            logger << log4cpp::Priority::ERROR << "Prefix " << route.key() << " is held in rustbgpd by another lease owner or "
+            logger << rustbgpd_error_priority(job) << "Prefix " << route.key() << " is held in rustbgpd by another lease owner or "
                    << "without lease. Remove it with: rbgp rib delete " << route.key() << " --override-owner";
         }
 
@@ -297,18 +323,23 @@ rustbgpd_call_result_t rustbgpd_add_route(const rustbgpd_route_t& route) {
     if (outcome != rustbgpd::v1::PATH_INJECT_OUTCOME_CREATED && outcome != rustbgpd::v1::PATH_INJECT_OUTCOME_REPLACED &&
         outcome != rustbgpd::v1::PATH_INJECT_OUTCOME_UNCHANGED) {
         // rustbgpd older than 0.79.0 or newer one with outcome we do not know. We will try again
-        logger << log4cpp::Priority::ERROR << "rustbgpd answered announce of " << route.key()
+        job.error = -1;
+        logger << rustbgpd_error_priority(job) << "rustbgpd answered announce of " << route.key()
                << " without recognised outcome (" << int(outcome) << "), will retry";
         return rustbgpd_call_result_t::failure;
     }
 
-    logger << log4cpp::Priority::INFO << "rustbgpd announced " << route.key() << " next hop " << route.next_hop
-           << " outcome " << rustbgpd::v1::PathInjectOutcome_Name(outcome);
+    // Full pass resends every route and most of them are unchanged
+    job.route_changed = outcome != rustbgpd::v1::PATH_INJECT_OUTCOME_UNCHANGED;
+
+    logger << (job.route_changed ? log4cpp::Priority::INFO : log4cpp::Priority::DEBUG) << "rustbgpd announced "
+           << route.key() << " next hop " << route.next_hop << " outcome " << rustbgpd::v1::PathInjectOutcome_Name(outcome);
 
     return rustbgpd_call_result_t::success;
 }
 
-rustbgpd_call_result_t rustbgpd_delete_route(const rustbgpd_route_t& route) {
+rustbgpd_call_result_t rustbgpd_delete_route(rustbgpd_job_t& job) {
+    const rustbgpd_route_t& route = job.route;
     rustbgpd::v1::DeletePathRequest request;
 
     request.set_prefix(route.prefix);
@@ -329,7 +360,9 @@ rustbgpd_call_result_t rustbgpd_delete_route(const rustbgpd_route_t& route) {
         rustbgpd_run_call(context, [&] { return rustbgpd_injection_stub->DeletePath(&context, request, &response); });
 
     if (!status.ok()) {
-        logger << log4cpp::Priority::ERROR << "rustbgpd rejected withdrawal of " << route.key() << ": "
+        job.error = status.error_code();
+
+        logger << rustbgpd_error_priority(job) << "rustbgpd rejected withdrawal of " << route.key() << ": "
                << rustbgpd_describe_status(status);
 
         return rustbgpd_is_transient_error(status) ? rustbgpd_call_result_t::transient_failure : rustbgpd_call_result_t::failure;
@@ -337,13 +370,16 @@ rustbgpd_call_result_t rustbgpd_delete_route(const rustbgpd_route_t& route) {
 
     if (response.outcome() != rustbgpd::v1::PATH_DELETE_OUTCOME_DELETED &&
         response.outcome() != rustbgpd::v1::PATH_DELETE_OUTCOME_NOT_PRESENT) {
-        logger << log4cpp::Priority::ERROR << "rustbgpd answered withdrawal of " << route.key()
+        job.error = -1;
+        logger << rustbgpd_error_priority(job) << "rustbgpd answered withdrawal of " << route.key()
                << " without recognised outcome (" << int(response.outcome()) << "), will retry";
         return rustbgpd_call_result_t::failure;
     }
 
-    logger << log4cpp::Priority::INFO << "rustbgpd withdrew " << route.key() << " outcome "
-           << rustbgpd::v1::PathDeleteOutcome_Name(response.outcome());
+    job.route_changed = response.outcome() == rustbgpd::v1::PATH_DELETE_OUTCOME_DELETED;
+
+    logger << (job.route_changed ? log4cpp::Priority::INFO : log4cpp::Priority::DEBUG) << "rustbgpd withdrew "
+           << route.key() << " outcome " << rustbgpd::v1::PathDeleteOutcome_Name(response.outcome());
 
     return rustbgpd_call_result_t::success;
 }
@@ -425,14 +461,20 @@ void rustbgpd_apply_result(const std::string& key, const rustbgpd_job_t& job, ru
 
         if (result == rustbgpd_call_result_t::transient_failure) {
             delay = std::min(std::chrono::milliseconds(500) * (1u << std::min(state.failures - 1, 5u)), max_delay);
+        } else if (job.error == state.last_error) {
+            // Same rejection again, operator has not fixed it yet: retry on reconcile interval only
+            delay = std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
         }
 
+        state.last_error  = job.error;
         state.retry_after = rustbgpd_clock_t::now() + delay;
         return;
     }
 
     state.synced_version = job.version;
     state.failures       = 0;
+    state.last_error     = 0;
+    state.changed        = false;
 
     if (state.contributors.empty()) {
         rustbgpd_routes.erase(it);
@@ -496,6 +538,12 @@ void rustbgpd_worker_thread() {
             rustbgpd_work_pending = false;
         }
 
+        // Channel which is not ready lost its connection since last probe: rustbgpd may have restarted faster than
+        // our probe could fail, so we handle it as reconnect and resend everything
+        if (rustbgpd_channel->GetState(false) != GRPC_CHANNEL_READY) {
+            reachable = false;
+        }
+
         grpc::Status probe = rustbgpd_check_liveness();
 
         if (rustbgpd_signal_stop) {
@@ -515,6 +563,7 @@ void rustbgpd_worker_thread() {
 
         std::vector<std::pair<std::string, rustbgpd_job_t>> jobs;
         bool renew_lease = false;
+        bool full_pass   = false;
         rustbgpd::v1::LeaseGeneration generation;
 
         {
@@ -526,9 +575,11 @@ void rustbgpd_worker_thread() {
                 logger << log4cpp::Priority::INFO << "rustbgpd is reachable, will announce all "
                        << rustbgpd_routes.size() << " routes again";
                 rustbgpd_schedule_full_pass();
+                full_pass = true;
                 next_full_pass = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
             } else if (now >= next_full_pass) {
                 rustbgpd_schedule_full_pass();
+                full_pass = true;
                 next_full_pass = now + std::chrono::seconds(fastnetmon_global_configuration.rustbgpd_reconcile_interval);
             }
 
@@ -537,13 +588,21 @@ void rustbgpd_worker_thread() {
             for (const auto& [key, state] : rustbgpd_routes) {
                 if (state.synced_version != state.version && state.retry_after <= now) {
                     rustbgpd_job_t job;
-                    job.route    = state.route;
-                    job.announce = !state.contributors.empty();
-                    job.version  = state.version;
+                    job.route      = state.route;
+                    job.announce   = !state.contributors.empty();
+                    job.version    = state.version;
+                    job.changed    = state.changed;
+                    job.last_error = state.last_error;
 
                     jobs.push_back({ key, job });
                 }
             }
+
+            // Changed bans and unbans go before resending of unchanged routes
+            std::stable_partition(jobs.begin(), jobs.end(), [](const auto& job) { return job.second.changed; });
+
+            // We took all work pending so far, only changes after this point should interrupt this round
+            rustbgpd_work_pending = false;
         }
 
         reachable        = true;
@@ -553,7 +612,9 @@ void rustbgpd_worker_thread() {
             rustbgpd_renew_lease(generation);
         }
 
-        for (const auto& [key, job] : jobs) {
+        unsigned int sent = 0, route_changes = 0, failed = 0;
+
+        for (auto& [key, job] : jobs) {
             // Many slow calls in one batch must not let our lease expire
             {
                 std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
@@ -564,7 +625,7 @@ void rustbgpd_worker_thread() {
                 rustbgpd_renew_lease(generation);
             }
 
-            rustbgpd_call_result_t result = job.announce ? rustbgpd_add_route(job.route) : rustbgpd_delete_route(job.route);
+            rustbgpd_call_result_t result = job.announce ? rustbgpd_add_route(job) : rustbgpd_delete_route(job);
 
             if (rustbgpd_signal_stop) {
                 return;
@@ -577,6 +638,22 @@ void rustbgpd_worker_thread() {
             }
 
             rustbgpd_apply_result(key, job, result);
+
+            sent++;
+            route_changes += job.route_changed;
+            failed += result != rustbgpd_call_result_t::success;
+
+            // rustbgpd does not answer in time: probe and back off instead of waiting on every other route.
+            // New ban or unban: handle it first, rest of this round waits for next one
+            if (result == rustbgpd_call_result_t::transient_failure || rustbgpd_work_pending) {
+                break;
+            }
+        }
+
+        if (full_pass && !jobs.empty()) {
+            logger << log4cpp::Priority::INFO << "rustbgpd full pass sent " << sent << " of " << jobs.size()
+                   << " routes: " << route_changes << " changed in rustbgpd, " << failed << " failed"
+                   << (sent < jobs.size() ? ", others in next round" : "");
         }
     }
 }
@@ -618,6 +695,7 @@ void rustbgpd_action_shutdown() {
     rustbgpd_lease_valid_until      = rustbgpd_clock_t::time_point{};
     rustbgpd_injection_stub.reset();
     rustbgpd_control_stub.reset();
+    rustbgpd_channel.reset();
     rustbgpd_token.clear();
 
     logger << log4cpp::Priority::INFO << "rustbgpd action stopped";
@@ -963,6 +1041,7 @@ bool rustbgpd_action_init() {
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
 
         rustbgpd_token          = token;
+        rustbgpd_channel        = channel;
         rustbgpd_injection_stub = rustbgpd::v1::InjectionService::NewStub(channel);
         rustbgpd_control_stub   = rustbgpd::v1::ControlService::NewStub(channel);
 
@@ -1088,6 +1167,8 @@ void rustbgpd_ban_manage(const std::string& action,
             state.version     = ++rustbgpd_last_version;
             state.retry_after = rustbgpd_clock_t::time_point{};
             state.failures    = 0;
+            state.last_error  = 0;
+            state.changed     = true;
         }
 
         logger << log4cpp::Priority::INFO << "rustbgpd " << (wanted_now ? "announce" : "withdrawal") << " of "

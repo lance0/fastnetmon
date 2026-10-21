@@ -70,7 +70,8 @@ class captured_log_t : public log4cpp::LayoutAppender {
     protected:
     void _append(const log4cpp::LoggingEvent& event) override {
         std::lock_guard<std::mutex> lock_guard(mutex);
-        buffer += event.message + "\n";
+        // Priority name first, so tests can check log level too
+        buffer += log4cpp::Priority::getPriorityName(event.priority) + " " + event.message + "\n";
     }
 
     private:
@@ -361,6 +362,40 @@ class RustbgpdActionTest : public ::testing::Test {
         captured_log->clear();
     }
 
+    // Stops mock rustbgpd, forgets its routes as restarted rustbgpd does and starts it again on the same socket
+    void restart_server(std::chrono::milliseconds gap) {
+        server->Shutdown(std::chrono::system_clock::now() + 1s);
+        server.reset();
+
+        {
+            std::lock_guard<std::mutex> lock_guard(state.mutex);
+            state.routes.clear();
+        }
+
+        std::this_thread::sleep_for(gap);
+
+        injection = std::make_unique<mock_injection_t>(state);
+        control   = std::make_unique<mock_control_t>(state);
+
+        grpc::ServerBuilder builder;
+        builder.AddListeningPort("unix://" + socket_path, grpc::InsecureServerCredentials());
+        builder.RegisterService(injection.get());
+        builder.RegisterService(control.get());
+        server = builder.BuildAndStart();
+        ASSERT_TRUE(server);
+    }
+
+    size_t count_lines(const std::string& text) {
+        std::string log = captured_log->text();
+        size_t count    = 0;
+
+        for (size_t position = log.find(text); position != std::string::npos; position = log.find(text, position + 1)) {
+            count++;
+        }
+
+        return count;
+    }
+
     void TearDown() override {
         rustbgpd_action_shutdown();
         server->Shutdown(std::chrono::system_clock::now() + 1s);
@@ -496,6 +531,83 @@ TEST_F(RustbgpdActionTest, unavailable_announce_backs_off) {
 
     state.add_status_code = grpc::StatusCode::OK;
     EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 10s));
+}
+
+// Announces stall longer than call deadline during full pass, while liveness probes still answer: unban of other host
+// must not wait behind all of them
+TEST_F(RustbgpdActionTest, withdrawal_not_stuck_behind_stalled_announces) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    std::vector<std::string> hosts = { "203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4", "203.0.113.9" };
+
+    for (const auto& host : hosts) {
+        ipv4_action("ban", host);
+    }
+
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.9/32"); }, 3s));
+
+    // Full pass after probe failure, every announce now takes 6 seconds against 5 second deadline
+    state.add_delay_ms  = 6000;
+    int adds            = state.adds_started;
+    state.liveness_code = grpc::StatusCode::UNAVAILABLE;
+    ASSERT_TRUE(wait_for([&] { return captured_log->text().find("did not answer liveness probe") != std::string::npos; }, 3s));
+    state.liveness_code = grpc::StatusCode::OK;
+    ASSERT_TRUE(wait_for([&] { return state.adds_started > adds; }, 3s));
+
+    // Host which sorts last in the pass
+    ipv4_action("unban", "203.0.113.9");
+
+    EXPECT_TRUE(wait_for([&] { return !state.has("203.0.113.9/32"); }, 8s))
+        << "withdrawal waited behind stalled announces";
+}
+
+// rustbgpd restart shorter than our probe interval and its deadline: connection loss alone must trigger full pass
+TEST_F(RustbgpdActionTest, short_restart_is_detected) {
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.7");
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+
+    for (auto gap : { 50ms, 300ms }) {
+        restart_server(gap);
+        EXPECT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 2s))
+            << "route not announced again after restart with " << gap.count() << " ms gap";
+    }
+}
+
+// Periodic pass resends every route: unchanged ones are logged at DEBUG, with one INFO summary per pass
+TEST_F(RustbgpdActionTest, periodic_pass_logs_summary_not_every_route) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    ipv4_action("ban", "203.0.113.7");
+    ipv4_action("ban", "203.0.113.8");
+    ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.8/32"); }, 3s));
+    EXPECT_EQ(count_lines(
+                  "INFO rustbgpd announced 203.0.113.7/32 next hop 0.0.0.0 outcome PATH_INJECT_OUTCOME_CREATED"),
+              1u);
+
+    captured_log->clear();
+    std::this_thread::sleep_for(2500ms);
+
+    EXPECT_GE(count_lines(
+                  "DEBUG rustbgpd announced 203.0.113.7/32 next hop 0.0.0.0 outcome PATH_INJECT_OUTCOME_UNCHANGED"),
+              1u);
+    EXPECT_EQ(count_lines("INFO rustbgpd announced"), 0u) << "unchanged routes logged at INFO";
+    EXPECT_GE(count_lines("INFO rustbgpd full pass sent 2 of 2 routes: 0 changed in rustbgpd, 0 failed"), 1u);
+}
+
+// Same rejection again and again: ERROR once, then DEBUG, and retries on reconcile interval
+TEST_F(RustbgpdActionTest, repeated_rejection_logged_once) {
+    configuration_map["rustbgpd_reconcile_interval"] = "1";
+    ASSERT_TRUE(rustbgpd_action_init());
+
+    state.add_status_code = grpc::StatusCode::FAILED_PRECONDITION;
+    ipv4_action("ban", "203.0.113.7");
+    ASSERT_TRUE(wait_for([&] { return state.adds_started >= 3; }, 6s));
+
+    EXPECT_EQ(count_lines("ERROR rustbgpd rejected announce of 203.0.113.7/32"), 1u);
+    EXPECT_GE(count_lines("DEBUG rustbgpd rejected announce of 203.0.113.7/32"), 1u);
 }
 
 // Shutdown cancels call in flight, joins worker and no calls happen after it
@@ -1024,7 +1136,7 @@ TEST_F(RustbgpdActionTest, lease_owner_checked_when_leases_enabled) {
 }
 
 // OK without outcome means rustbgpd older than 0.79.0 or unknown outcome: we keep retrying. Periodic pass is
-// every 30 seconds here, failed call is retried in 10 seconds
+// every 30 seconds here, first retry of failed call is in 10 seconds
 TEST_F(RustbgpdActionTest, unrecognised_outcome_is_retried) {
     ASSERT_TRUE(rustbgpd_action_init());
 
@@ -1034,11 +1146,8 @@ TEST_F(RustbgpdActionTest, unrecognised_outcome_is_retried) {
     EXPECT_NE(captured_log->text().find("rustbgpd answered announce of 203.0.113.7/32 without recognised outcome (0)"),
               std::string::npos);
 
-    state.omit_outcome = false;
-    EXPECT_TRUE(
-        wait_for([&] { return captured_log->text().find("outcome PATH_INJECT_OUTCOME_UNCHANGED") != std::string::npos; }, 12s));
-
-    state.omit_outcome = true;
+    // Same failure again would wait for reconcile interval now. Unban changes desired state, so its withdrawal is
+    // sent at once and retried in 10 seconds
     ipv4_action("unban", "203.0.113.7");
     EXPECT_TRUE(wait_for([&] { return state.deletes >= 2; }, 12s)) << "withdrawal was not retried";
     EXPECT_NE(captured_log->text().find(
@@ -1081,7 +1190,7 @@ extern "C" const char* __asan_default_options() {
 int main(int argc, char** argv) {
     captured_log = new captured_log_t;
     logger.addAppender(captured_log);
-    logger.setPriority(log4cpp::Priority::INFO);
+    logger.setPriority(log4cpp::Priority::DEBUG);
 
     ::testing::InitGoogleTest(&argc, argv);
 
