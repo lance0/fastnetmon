@@ -461,6 +461,41 @@ class RustbgpdActionTest : public ::testing::Test {
         return path;
     }
 
+    std::string tls_file(const std::string& name) {
+        std::ifstream input(std::string(RUSTBGPD_TEST_CERT_DIR) + "/" + name);
+        return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    }
+
+    void configure_tls() {
+        configuration_map["rustbgpd_target"] = "localhost:50051";
+        configuration_map["rustbgpd_tls_ca_file"] = write_file("ca.pem", tls_file("ca.pem"), 0644);
+        configuration_map["rustbgpd_tls_cert_file"] = write_file("client.pem", tls_file("client.pem"), 0644);
+        configuration_map["rustbgpd_tls_key_file"] = write_file("client.key", tls_file("client.key"), 0600);
+    }
+
+    void start_tcp_server(bool tls) {
+        server->Shutdown(std::chrono::system_clock::now() + 1s);
+        grpc::ServerBuilder builder;
+        std::shared_ptr<grpc::ServerCredentials> credentials;
+        if (tls) {
+            grpc::SslServerCredentialsOptions options;
+            options.pem_root_certs = tls_file("ca.pem");
+            options.pem_key_cert_pairs.push_back({ tls_file("server.key"), tls_file("server.pem") });
+            options.client_certificate_request = GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+            credentials = grpc::SslServerCredentials(options);
+        } else {
+            credentials = grpc::InsecureServerCredentials();
+        }
+        int port = 0;
+        builder.AddListeningPort("127.0.0.1:0", credentials, &port);
+        builder.RegisterService(injection.get());
+        builder.RegisterService(control.get());
+        server = builder.BuildAndStart();
+        ASSERT_TRUE(server);
+        ASSERT_GT(port, 0);
+        configuration_map["rustbgpd_target"] = "localhost:" + std::to_string(port);
+    }
+
     mock_state_t state;
     std::unique_ptr<mock_injection_t> injection;
     std::unique_ptr<mock_control_t> control;
@@ -1725,6 +1760,100 @@ TEST_F(RustbgpdActionTest, tcp_target_sends_token) {
 
     std::lock_guard<std::mutex> lock_guard(state.mutex);
     EXPECT_EQ(state.last_authorization, "Bearer secret-token");
+}
+
+TEST_F(RustbgpdActionTest, tls_options_must_be_complete) {
+    for (unsigned int mask = 1; mask < 7; mask++) {
+        configure_tls();
+        if (!(mask & 1)) configuration_map["rustbgpd_tls_ca_file"] = "";
+        if (!(mask & 2)) configuration_map["rustbgpd_tls_cert_file"] = "";
+        if (!(mask & 4)) configuration_map["rustbgpd_tls_key_file"] = "";
+        EXPECT_FALSE(rustbgpd_action_init()) << "accepted partial TLS set " << mask;
+        rustbgpd_action_shutdown();
+    }
+}
+
+TEST_F(RustbgpdActionTest, tls_key_file_checks) {
+    configure_tls();
+    auto good = configuration_map["rustbgpd_tls_key_file"];
+    auto link = directory + "/key-link";
+    ASSERT_EQ(symlink(good.c_str(), link.c_str()), 0);
+    auto fifo = directory + "/key-fifo";
+    ASSERT_EQ(mkfifo(fifo.c_str(), 0600), 0);
+    for (const auto& path : { link, fifo, directory, directory + "/missing",
+                             write_file("open.key", tls_file("client.key"), 0644),
+                             write_file("group.key", tls_file("client.key"), 0640),
+                             write_file("empty.key", "", 0600),
+                             write_file("large.key", std::string(1024 * 1024 + 1, 'x'), 0600) }) {
+        configuration_map["rustbgpd_tls_key_file"] = path;
+        auto result = std::async(std::launch::async, [] { return rustbgpd_action_init(); });
+        if (result.wait_for(2s) != std::future_status::ready) {
+            ADD_FAILURE() << "key check blocked on " << path;
+            int writer = open(fifo.c_str(), O_WRONLY | O_NONBLOCK);
+            close(writer);
+        }
+        EXPECT_FALSE(result.get()) << "accepted key " << path;
+        rustbgpd_action_shutdown();
+    }
+    EXPECT_EQ(captured_log->text().find("PRIVATE KEY"), std::string::npos);
+}
+
+TEST_F(RustbgpdActionTest, tls_accepts_remote_targets_but_not_resolver_uris) {
+    configure_tls();
+    for (const std::string target : { "announcer.example:50051", "192.0.2.1:443", "[2001:db8::1]:50051" }) {
+        configuration_map["rustbgpd_target"] = target;
+        EXPECT_TRUE(rustbgpd_action_init()) << target;
+        rustbgpd_action_shutdown();
+    }
+    for (const std::string target : { "dns:///localhost:50051", "localhost:0", "localhost:65536", "localhost:1x",
+                                      ":50051", "unix:///tmp/grpc.sock", "[invalid]:443", "local host:443" }) {
+        configuration_map["rustbgpd_target"] = target;
+        EXPECT_FALSE(rustbgpd_action_init()) << target;
+        rustbgpd_action_shutdown();
+    }
+}
+
+TEST_F(RustbgpdActionTest, tls_announces_and_withdraws_with_optional_token) {
+    for (bool token : { false, true }) {
+        configure_tls();
+        start_tcp_server(true);
+        if (token) {
+            configuration_map["rustbgpd_token_file"] = write_file("token", "secret-token\n", 0600);
+        }
+        ASSERT_TRUE(rustbgpd_action_init());
+        ipv4_action("ban", "203.0.113.7");
+        ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+        {
+            std::lock_guard<std::mutex> lock_guard(state.mutex);
+            EXPECT_EQ(state.last_authorization, token ? "Bearer secret-token" : "");
+        }
+        ipv4_action("unban", "203.0.113.7");
+        ASSERT_TRUE(wait_for([&] { return !state.has("203.0.113.7/32"); }, 3s));
+        rustbgpd_action_shutdown();
+    }
+}
+
+TEST_F(RustbgpdActionTest, tls_wrong_ca_name_and_plaintext_server_fail_closed) {
+    for (const std::string failure : { "wrong CA", "wrong name", "plaintext server" }) {
+        SCOPED_TRACE(failure);
+        configure_tls();
+        start_tcp_server(failure != "plaintext server");
+        if (failure == "wrong CA") {
+            configuration_map["rustbgpd_tls_ca_file"] = write_file("wrong-ca.pem", tls_file("wrong-ca.pem"), 0644);
+        } else if (failure == "wrong name") {
+            auto& target = configuration_map["rustbgpd_target"];
+            target.replace(0, std::string("localhost").size(), "127.0.0.1");
+        }
+        captured_log->clear();
+        ASSERT_TRUE(rustbgpd_action_init());
+        ipv4_action("ban", "203.0.113.7");
+        ASSERT_TRUE(wait_for([&] { return captured_log->text().find("did not answer liveness probe") != std::string::npos; }, 4s));
+        // Observe further retries after the first failed probe; no RPC may reach the mock.
+        EXPECT_FALSE(wait_for([&] { return state.adds_started > 0; }, 2s));
+        rustbgpd_action_shutdown();
+        EXPECT_EQ(state.adds_started, 0);
+        EXPECT_FALSE(state.has("203.0.113.7/32"));
+    }
 }
 
 TEST_F(RustbgpdActionTest, token_file_checks) {

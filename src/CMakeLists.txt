@@ -1209,6 +1209,13 @@ if (BUILD_TESTS)
     if (ENABLE_GOBGP_SUPPORT AND ENABLE_RUSTBGPD_SUPPORT)
         # rustbgpd action against in-process mock of rustbgpd's gRPC API
         add_executable(rustbgpd_action_tests tests/rustbgpd_action_tests.cpp)
+        # Fresh certificates avoid checked-in private keys and expiring TLS fixtures.
+        set(RUSTBGPD_TEST_CERT_DIR "${CMAKE_CURRENT_BINARY_DIR}/rustbgpd-test-certs")
+        add_custom_target(rustbgpd_test_certificates
+            COMMAND bash "${PROJECT_SOURCE_DIR}/../tests/rustbgpd/make-test-certificates.sh" "${RUSTBGPD_TEST_CERT_DIR}"
+            VERBATIM)
+        add_dependencies(rustbgpd_action_tests rustbgpd_test_certificates)
+        target_compile_definitions(rustbgpd_action_tests PRIVATE RUSTBGPD_TEST_CERT_DIR="${RUSTBGPD_TEST_CERT_DIR}")
         target_link_libraries(rustbgpd_action_tests rustbgpd_action bgp_protocol fast_library ${LOG4CPP_LIBRARY_PATH})
         target_link_libraries(rustbgpd_action_tests ${Boost_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${GTEST_LIBRARY_PATH})
     endif()

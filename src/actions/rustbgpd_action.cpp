@@ -1041,10 +1041,8 @@ bool rustbgpd_read_community(const std::string& name, std::string& value) {
     return true;
 }
 
-// Accepts unix:///absolute/path, or literal loopback address with port: 127.0.0.0/8 as 127.0.0.1:50051 or ::1 as
-// [::1]:50051. We never accept host names: bearer token must not leave this host. Sets target for gRPC which
-// does not use DNS resolver
-bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, bool& unix_socket) {
+// Plaintext stays on Unix sockets or literal loopback; TLS also accepts DNS names and remote IP addresses.
+bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, bool& unix_socket, bool tls) {
     unix_socket = false;
 
     if (target.rfind("unix:", 0) == 0) {
@@ -1054,7 +1052,7 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
             path = path.substr(2);
         }
 
-        if (path.empty() || path[0] != '/') {
+        if (tls || path.empty() || path[0] != '/') {
             return false;
         }
 
@@ -1078,7 +1076,7 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
 
         struct in6_addr address;
 
-        if (inet_pton(AF_INET6, host.c_str(), &address) != 1 || !IN6_IS_ADDR_LOOPBACK(&address)) {
+        if (inet_pton(AF_INET6, host.c_str(), &address) != 1 || (!tls && !IN6_IS_ADDR_LOOPBACK(&address))) {
             return false;
         }
 
@@ -1096,7 +1094,12 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
         // inet_pton accepts only four decimal octets, never names
         struct in_addr address;
 
-        if (inet_pton(AF_INET, host.c_str(), &address) != 1 || (ntohl(address.s_addr) >> 24) != 127) {
+        if (tls) {
+            if (host.empty() ||
+                host.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-") != std::string::npos) {
+                return false;
+            }
+        } else if (inet_pton(AF_INET, host.c_str(), &address) != 1 || (ntohl(address.s_addr) >> 24) != 127) {
             return false;
         }
 
@@ -1113,7 +1116,7 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
         return false;
     }
 
-    grpc_target += port;
+    grpc_target = tls ? target : grpc_target + port;
     return true;
 }
 
@@ -1133,79 +1136,70 @@ std::string rustbgpd_check_token_file_metadata(const struct stat& file_stat, uid
     return "";
 }
 
-// Reads bearer token. File must be regular file of user who runs FastNetMon or root, without access for group
-// and others. We never log token itself
-bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
-    const size_t max_token_file_size = 4096;
-
+// Open once and check that descriptor, including owner-only permissions for tokens and private keys.
+// O_NONBLOCK prevents a FIFO from hanging startup before fstat can reject it.
+bool rustbgpd_read_credential_file(const std::string& option, const std::string& path, bool secret,
+                                  size_t max_size, std::string& content) {
     int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
 
     if (fd < 0) {
-        logger << log4cpp::Priority::ERROR << "Cannot open rustbgpd_token_file " << path << ": " << strerror(errno)
+        logger << log4cpp::Priority::ERROR << "Cannot open " << option << " " << path << ": " << strerror(errno)
                << (errno == ELOOP || errno == EMLINK ? " (symbolic links are not allowed)" : "");
         return false;
     }
 
     struct stat file_stat;
     std::string error;
+    content.clear();
 
     if (fstat(fd, &file_stat) != 0) {
         error = std::string("cannot stat it: ") + strerror(errno);
-    } else {
+    } else if (secret) {
         error = rustbgpd_check_token_file_metadata(file_stat, geteuid());
+    } else if (!S_ISREG(file_stat.st_mode)) {
+        error = "it is not a regular file";
     }
 
-    std::string content;
-
-    if (error.empty()) {
-        char buffer[max_token_file_size + 1];
-        size_t total = 0;
-
-        while (total < sizeof(buffer)) {
-            ssize_t got = read(fd, buffer + total, sizeof(buffer) - total);
-
-            if (got < 0 && errno == EINTR) {
-                continue;
-            }
-
-            if (got < 0) {
-                error = std::string("cannot read it: ") + strerror(errno);
-                break;
-            }
-
-            if (got == 0) {
-                break;
-            }
-
-            total += got;
+    char buffer[4096];
+    while (error.empty()) {
+        ssize_t got = read(fd, buffer, sizeof(buffer));
+        if (got < 0 && errno == EINTR) {
+            continue;
         }
-
-        if (error.empty() && total > max_token_file_size) {
-            error = "it is larger than " + std::to_string(max_token_file_size) + " bytes";
+        if (got < 0) {
+            error = std::string("cannot read it: ") + strerror(errno);
+        } else if (got == 0) {
+            break;
+        } else if (content.size() + size_t(got) > max_size) {
+            error = "it is larger than " + std::to_string(max_size) + " bytes";
+        } else {
+            content.append(buffer, size_t(got));
         }
-
-        content.assign(buffer, error.empty() ? total : 0);
     }
-
     close(fd);
 
-    if (error.empty()) {
-        boost::algorithm::trim(content);
-
-        if (content.empty()) {
-            error = "it is empty";
-        } else if (std::any_of(content.begin(), content.end(), [](char c) { return c < 0x21 || c > 0x7e; })) {
-            // Token goes to HTTP/2 header
-            error = "token must consist of printable ASCII characters without spaces";
-        }
+    if (error.empty() && content.empty()) {
+        error = "it is empty";
     }
-
     if (!error.empty()) {
-        logger << log4cpp::Priority::ERROR << "Cannot use rustbgpd_token_file " << path << ": " << error;
+        logger << log4cpp::Priority::ERROR << "Cannot use " << option << " " << path << ": " << error;
+        content.clear();
         return false;
     }
+    return true;
+}
 
-    token = content;
+bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
+    if (!rustbgpd_read_credential_file("rustbgpd_token_file", path, true, 4096, token)) {
+        return false;
+    }
+    boost::algorithm::trim(token);
+    if (token.empty() || std::any_of(token.begin(), token.end(), [](char c) { return c < 0x21 || c > 0x7e; })) {
+        logger << log4cpp::Priority::ERROR << "Cannot use rustbgpd_token_file " << path
+               << ": token must consist of printable ASCII characters without spaces";
+        token.clear();
+        return false;
+    }
     return true;
 }
 
@@ -1228,6 +1222,9 @@ bool rustbgpd_action_init() {
 
     rustbgpd_read_string("rustbgpd_target", configuration.rustbgpd_target);
     rustbgpd_read_string("rustbgpd_token_file", configuration.rustbgpd_token_file);
+    rustbgpd_read_string("rustbgpd_tls_ca_file", configuration.rustbgpd_tls_ca_file);
+    rustbgpd_read_string("rustbgpd_tls_cert_file", configuration.rustbgpd_tls_cert_file);
+    rustbgpd_read_string("rustbgpd_tls_key_file", configuration.rustbgpd_tls_key_file);
     rustbgpd_read_bool("rustbgpd_announce_host", configuration.rustbgpd_announce_host);
     rustbgpd_read_bool("rustbgpd_announce_whole_subnet", configuration.rustbgpd_announce_whole_subnet);
     rustbgpd_read_bool("rustbgpd_announce_host_ipv6", configuration.rustbgpd_announce_host_ipv6);
@@ -1248,14 +1245,22 @@ bool rustbgpd_action_init() {
         return false;
     }
 
-    // rustbgpd accepts plaintext gRPC only from its owner-only Unix socket or with bearer token
-    // We do not send token in plaintext anywhere but loopback
+    unsigned int tls_files = !configuration.rustbgpd_tls_ca_file.empty() +
+                             unsigned(!configuration.rustbgpd_tls_cert_file.empty()) +
+                             unsigned(!configuration.rustbgpd_tls_key_file.empty());
+    if (tls_files != 0 && tls_files != 3) {
+        logger << log4cpp::Priority::ERROR
+               << "rustbgpd_tls_ca_file, rustbgpd_tls_cert_file and rustbgpd_tls_key_file must all be set together";
+        return false;
+    }
+    bool tls = tls_files == 3;
     std::string grpc_target;
     bool unix_socket = false;
 
-    if (!rustbgpd_parse_target(configuration.rustbgpd_target, grpc_target, unix_socket)) {
-        logger << log4cpp::Priority::ERROR << "rustbgpd_target must be unix:///absolute/path or literal loopback address "
-               << "with port such as 127.0.0.1:50051 or [::1]:50051, got " << configuration.rustbgpd_target;
+    if (!rustbgpd_parse_target(configuration.rustbgpd_target, grpc_target, unix_socket, tls)) {
+        logger << log4cpp::Priority::ERROR << "Invalid rustbgpd_target " << configuration.rustbgpd_target
+               << (tls ? ": TLS requires hostname:port or [IPv6]:port"
+                       : ": plaintext requires unix:///absolute/path or a literal loopback address with port");
         return false;
     }
 
@@ -1265,9 +1270,22 @@ bool rustbgpd_action_init() {
         return false;
     }
 
-    if (!unix_socket && token.empty()) {
+    if (!tls && !unix_socket && token.empty()) {
         logger << log4cpp::Priority::ERROR << "rustbgpd accepts TCP connections only with token, please set rustbgpd_token_file";
         return false;
+    }
+
+    grpc::SslCredentialsOptions options;
+    if (tls) {
+        const size_t max_pem_size = 1024 * 1024;
+        if (!rustbgpd_read_credential_file("rustbgpd_tls_ca_file", configuration.rustbgpd_tls_ca_file, false,
+                                           max_pem_size, options.pem_root_certs) ||
+            !rustbgpd_read_credential_file("rustbgpd_tls_cert_file", configuration.rustbgpd_tls_cert_file, false,
+                                           max_pem_size, options.pem_cert_chain) ||
+            !rustbgpd_read_credential_file("rustbgpd_tls_key_file", configuration.rustbgpd_tls_key_file, true,
+                                           max_pem_size, options.pem_private_key)) {
+            return false;
+        }
     }
 
     if (configuration.rustbgpd_lease && !rustbgpd_valid_lease_owner(configuration.rustbgpd_lease_owner)) {
@@ -1292,8 +1310,8 @@ bool rustbgpd_action_init() {
     // Retrying connection to absent Unix socket or closed loopback port is cheap
     // We keep default minimum connect timeout (GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 20 seconds) as it also limits time
     // for HTTP/2 handshake
-    // gRPC sends even literal addresses through proxy from grpc_proxy, https_proxy or http_proxy. Our channel is
-    // plaintext and carries bearer token, it must go to rustbgpd directly
+    // gRPC sends even literal addresses through proxy from grpc_proxy, https_proxy or http_proxy. Our channel
+    // may carry a plaintext bearer token, so always connect to rustbgpd directly
     channel_arguments.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
 
     channel_arguments.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 250);
@@ -1308,7 +1326,15 @@ bool rustbgpd_action_init() {
     sigaddset(&shutdown_signals, SIGINT);
     pthread_sigmask(SIG_BLOCK, &shutdown_signals, &previous_signals);
 
-    auto channel = grpc::CreateCustomChannel(grpc_target, grpc::InsecureChannelCredentials(), channel_arguments);
+    // Credentials initialize gRPC too, so create them while SIGINT is blocked.
+    // Keep normal certificate/target-name verification and never fall back to plaintext.
+    auto credentials = tls ? grpc::SslCredentials(options) : grpc::InsecureChannelCredentials();
+    if (!credentials) {
+        pthread_sigmask(SIG_SETMASK, &previous_signals, nullptr);
+        logger << log4cpp::Priority::ERROR << "Cannot create rustbgpd channel credentials";
+        return false;
+    }
+    auto channel = grpc::CreateCustomChannel(grpc_target, credentials, channel_arguments);
 
     {
         std::lock_guard<std::mutex> lock_guard(rustbgpd_mutex);
