@@ -7,8 +7,8 @@ topology:
       image: ${FNM_MTLS_IMAGE:=fastnetmon-rustbgpd:mtls}
       cmd: sleep infinity
       binds:
-        - ${MTLS_CERT_DIR}/ca.pem:/certs/ca.pem:ro
-        - ${MTLS_CERT_DIR}/client.pem:/certs/client.pem:ro
+        - ${MTLS_CERT_DIR}/ca.pem:/certs-source/ca.pem:ro
+        - ${MTLS_CERT_DIR}/client.pem:/certs-source/client.pem:ro
         - ${MTLS_CERT_DIR}/client.key:/certs-source/client.key:ro
       exec:
         - ip addr add 10.126.0.2/24 dev eth1

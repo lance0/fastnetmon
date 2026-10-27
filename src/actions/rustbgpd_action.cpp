@@ -1121,7 +1121,7 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
     return true;
 }
 
-std::string rustbgpd_check_token_file_metadata(const struct stat& file_stat, uid_t effective_uid) {
+std::string rustbgpd_check_token_file_metadata(const struct stat& file_stat, uid_t effective_uid, bool secret) {
     if (!S_ISREG(file_stat.st_mode)) {
         return "it is not a regular file";
     }
@@ -1130,15 +1130,20 @@ std::string rustbgpd_check_token_file_metadata(const struct stat& file_stat, uid
         return "it must be owned by the user who runs FastNetMon or by root";
     }
 
-    if ((file_stat.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+    if (secret && (file_stat.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
         return "it must not be accessible by group or others, use chmod 600";
+    }
+
+    if (!secret && (file_stat.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        return "it must not be writable by group or others, use chmod 644";
     }
 
     return "";
 }
 
-// Open once and check that descriptor, including owner-only permissions for tokens and private keys.
-// O_NONBLOCK prevents a FIFO from hanging startup before fstat can reject it.
+// Opens once and checks that descriptor: owner-only permissions for tokens and private keys, no write access
+// for group or others for CA and certificate files. O_NONBLOCK prevents a FIFO from hanging startup before fstat
+// can reject it
 bool rustbgpd_read_credential_file(const std::string& option, const std::string& path, bool secret,
                                    size_t max_size, std::string& content) {
     int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
@@ -1155,10 +1160,8 @@ bool rustbgpd_read_credential_file(const std::string& option, const std::string&
 
     if (fstat(fd, &file_stat) != 0) {
         error = std::string("cannot stat it: ") + strerror(errno);
-    } else if (secret) {
-        error = rustbgpd_check_token_file_metadata(file_stat, geteuid());
-    } else if (!S_ISREG(file_stat.st_mode)) {
-        error = "it is not a regular file";
+    } else {
+        error = rustbgpd_check_token_file_metadata(file_stat, geteuid(), secret);
     }
 
     char buffer[4096];

@@ -1812,6 +1812,34 @@ TEST_F(RustbgpdActionTest, tls_key_file_checks) {
     EXPECT_EQ(captured_log->text().find("PRIVATE KEY"), std::string::npos);
 }
 
+// CA and certificate may be readable by others, but nobody else may replace them
+TEST_F(RustbgpdActionTest, tls_ca_and_certificate_file_checks) {
+    for (const std::string option : { "rustbgpd_tls_ca_file", "rustbgpd_tls_cert_file" }) {
+        SCOPED_TRACE(option);
+        configure_tls();
+        auto content = tls_file(option == "rustbgpd_tls_ca_file" ? "ca.pem" : "client.pem");
+        auto link    = directory + "/" + option + "-link";
+        ASSERT_EQ(symlink(configuration_map[option].c_str(), link.c_str()), 0);
+
+        for (const auto& path : { link, directory, directory + "/missing", write_file(option + "-empty", "", 0644),
+                                  write_file(option + "-group-writable", content, 0664),
+                                  write_file(option + "-world-writable", content, 0646),
+                                  write_file(option + "-group-only-writable", content, 0620) }) {
+            configuration_map[option] = path;
+            captured_log->clear();
+            EXPECT_FALSE(rustbgpd_action_init()) << "accepted " << path;
+            EXPECT_NE(captured_log->text().find(option), std::string::npos) << "no error names " << option;
+            rustbgpd_action_shutdown();
+        }
+
+        for (mode_t mode : { 0644, 0444, 0600 }) {
+            configuration_map[option] = write_file(option + "-mode-" + std::to_string(mode), content, mode);
+            EXPECT_TRUE(rustbgpd_action_init()) << "rejected mode " << std::oct << mode;
+            rustbgpd_action_shutdown();
+        }
+    }
+}
+
 // Hosts named like gRPC resolver schemes must stay DNS names. Before TLS targets were passed as dns:///host:port,
 // this target reached the mock below through its abstract Unix socket
 TEST_F(RustbgpdActionTest, tls_host_named_like_resolver_scheme_is_dns_name) {
@@ -1979,6 +2007,36 @@ TEST(rustbgpd_token_file_metadata, owner_and_mode) {
 
     file_stat.st_mode = S_IFIFO | 0600;
     EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me), "");
+}
+
+// CA and certificate files: like secrets, but group and others may read them
+TEST(rustbgpd_token_file_metadata, public_file_owner_and_mode) {
+    uid_t me = 1000;
+
+    struct stat file_stat {};
+
+    for (mode_t mode : { 0644, 0444, 0600, 0640, 0604 }) {
+        file_stat.st_mode = S_IFREG | mode;
+        file_stat.st_uid  = me;
+        EXPECT_EQ(rustbgpd_check_token_file_metadata(file_stat, me, false), "") << std::oct << mode;
+        file_stat.st_uid = 0;
+        EXPECT_EQ(rustbgpd_check_token_file_metadata(file_stat, me, false), "") << std::oct << mode;
+    }
+
+    file_stat.st_uid = me;
+
+    for (mode_t mode : { 0664, 0646, 0620, 0602, 0666 }) {
+        file_stat.st_mode = S_IFREG | mode;
+        EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me, false), "") << std::oct << mode;
+    }
+
+    file_stat.st_mode = S_IFREG | 0644;
+    file_stat.st_uid  = me + 1;
+    EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me, false), "") << "accepted file of another user";
+
+    file_stat.st_uid  = me;
+    file_stat.st_mode = S_IFDIR | 0755;
+    EXPECT_NE(rustbgpd_check_token_file_metadata(file_stat, me, false), "");
 }
 
 TEST_F(RustbgpdActionTest, lease_owner_checked_when_leases_enabled) {

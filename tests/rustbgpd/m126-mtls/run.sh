@@ -51,8 +51,9 @@ git -C "$repo" diff --binary HEAD > "$results/fastnetmon-diff.patch"
 deployed=1
 containerlab deploy -t "$topology" > "$results/deploy.log" 2>&1
 docker exec "$frr" touch /etc/frr/vtysh.conf
-# Bind mounts retain the host UID; the key must belong to the container's runtime user.
-docker exec "$detector" sh -c 'cp /certs-source/client.key /certs/client.key && chmod 600 /certs/client.key'
+# Bind mounts retain the host UID; FastNetMon requires its TLS files to belong to its runtime user or root.
+docker exec "$detector" sh -c 'mkdir -p /certs && cp /certs-source/ca.pem /certs-source/client.pem /certs-source/client.key /certs/ &&
+    chmod 644 /certs/ca.pem /certs/client.pem && chmod 600 /certs/client.key'
 docker exec "$daemon" sh -c 'cp /certs-source/server.key /certs/server.key && chmod 600 /certs/server.key'
 docker exec "$daemon" rustbgpd --version | tee "$results/rustbgpd-version.txt"
 docker exec "$detector" fastnetmon --version | tee "$results/fastnetmon-version.txt"

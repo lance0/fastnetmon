@@ -41,8 +41,8 @@ rustbgpd_community_host_ipv6 = 65535:666
 | `rustbgpd` | `off` | Enable the action |
 | `rustbgpd_target` | `unix:///var/lib/rustbgpd/grpc.sock` | rustbgpd gRPC endpoint: `unix:///absolute/path`, or a literal loopback address and port: `127.0.0.1:50051` (any address in 127.0.0.0/8) or `[::1]:50051`. With mTLS, also accepts a host name or remote IP address and port |
 | `rustbgpd_token_file` | empty | File with the bearer token; sent as `authorization: Bearer <token>` on every call. Required for plaintext TCP; optional with mTLS. It must be a regular file (not a symbolic link) owned by the user who runs FastNetMon or by root, with no group or other permissions (`chmod 600`), at most 4096 bytes, one token of printable ASCII characters |
-| `rustbgpd_tls_ca_file` | empty | PEM CA bundle used to verify the server certificate; set together with the client certificate and key |
-| `rustbgpd_tls_cert_file` | empty | PEM client certificate chain; its principal must have the `operator` role in rustbgpd |
+| `rustbgpd_tls_ca_file` | empty | PEM CA bundle used to verify the server certificate; set together with the client certificate and key. Same owner and no-symbolic-link requirements as the token file; must not be writable by group or others |
+| `rustbgpd_tls_cert_file` | empty | PEM client certificate chain; its principal must have the `operator` role in rustbgpd. Same file requirements as the CA file |
 | `rustbgpd_tls_key_file` | empty | PEM client private key; same owner, mode and no-symbolic-link requirements as the token file |
 | `rustbgpd_next_hop_host_ipv4` | `0.0.0.0` | Next hop for IPv4 host announces; `0.0.0.0` means next hop self |
 | `rustbgpd_next_hop_subnet_ipv4` | `0.0.0.0` | Next hop for IPv4 subnet announces |
