@@ -1765,9 +1765,19 @@ TEST_F(RustbgpdActionTest, tcp_target_sends_token) {
 TEST_F(RustbgpdActionTest, tls_options_must_be_complete) {
     for (unsigned int mask = 1; mask < 7; mask++) {
         configure_tls();
-        if (!(mask & 1)) configuration_map["rustbgpd_tls_ca_file"] = "";
-        if (!(mask & 2)) configuration_map["rustbgpd_tls_cert_file"] = "";
-        if (!(mask & 4)) configuration_map["rustbgpd_tls_key_file"] = "";
+
+        if (!(mask & 1)) {
+            configuration_map["rustbgpd_tls_ca_file"] = "";
+        }
+
+        if (!(mask & 2)) {
+            configuration_map["rustbgpd_tls_cert_file"] = "";
+        }
+
+        if (!(mask & 4)) {
+            configuration_map["rustbgpd_tls_key_file"] = "";
+        }
+
         EXPECT_FALSE(rustbgpd_action_init()) << "accepted partial TLS set " << mask;
         rustbgpd_action_shutdown();
     }

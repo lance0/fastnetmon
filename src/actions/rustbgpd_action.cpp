@@ -1139,7 +1139,7 @@ std::string rustbgpd_check_token_file_metadata(const struct stat& file_stat, uid
 // Open once and check that descriptor, including owner-only permissions for tokens and private keys.
 // O_NONBLOCK prevents a FIFO from hanging startup before fstat can reject it.
 bool rustbgpd_read_credential_file(const std::string& option, const std::string& path, bool secret,
-                                  size_t max_size, std::string& content) {
+                                   size_t max_size, std::string& content) {
     int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
 
     if (fd < 0) {
@@ -1161,11 +1161,14 @@ bool rustbgpd_read_credential_file(const std::string& option, const std::string&
     }
 
     char buffer[4096];
+
     while (error.empty()) {
         ssize_t got = read(fd, buffer, sizeof(buffer));
+
         if (got < 0 && errno == EINTR) {
             continue;
         }
+
         if (got < 0) {
             error = std::string("cannot read it: ") + strerror(errno);
         } else if (got == 0) {
@@ -1176,16 +1179,19 @@ bool rustbgpd_read_credential_file(const std::string& option, const std::string&
             content.append(buffer, size_t(got));
         }
     }
+
     close(fd);
 
     if (error.empty() && content.empty()) {
         error = "it is empty";
     }
+
     if (!error.empty()) {
         logger << log4cpp::Priority::ERROR << "Cannot use " << option << " " << path << ": " << error;
         content.clear();
         return false;
     }
+
     return true;
 }
 
@@ -1193,6 +1199,7 @@ bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
     if (!rustbgpd_read_credential_file("rustbgpd_token_file", path, true, 4096, token)) {
         return false;
     }
+
     boost::algorithm::trim(token);
     if (token.empty() || std::any_of(token.begin(), token.end(), [](char c) { return c < 0x21 || c > 0x7e; })) {
         logger << log4cpp::Priority::ERROR << "Cannot use rustbgpd_token_file " << path
@@ -1200,6 +1207,7 @@ bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
         token.clear();
         return false;
     }
+
     return true;
 }
 
@@ -1248,11 +1256,13 @@ bool rustbgpd_action_init() {
     unsigned int tls_files = !configuration.rustbgpd_tls_ca_file.empty() +
                              unsigned(!configuration.rustbgpd_tls_cert_file.empty()) +
                              unsigned(!configuration.rustbgpd_tls_key_file.empty());
+
     if (tls_files != 0 && tls_files != 3) {
         logger << log4cpp::Priority::ERROR
                << "rustbgpd_tls_ca_file, rustbgpd_tls_cert_file and rustbgpd_tls_key_file must all be set together";
         return false;
     }
+
     bool tls = tls_files == 3;
     std::string grpc_target;
     bool unix_socket = false;
@@ -1276,8 +1286,10 @@ bool rustbgpd_action_init() {
     }
 
     grpc::SslCredentialsOptions options;
+
     if (tls) {
         const size_t max_pem_size = 1024 * 1024;
+
         if (!rustbgpd_read_credential_file("rustbgpd_tls_ca_file", configuration.rustbgpd_tls_ca_file, false,
                                            max_pem_size, options.pem_root_certs) ||
             !rustbgpd_read_credential_file("rustbgpd_tls_cert_file", configuration.rustbgpd_tls_cert_file, false,
