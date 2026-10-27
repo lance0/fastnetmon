@@ -3,7 +3,9 @@
 set -euo pipefail
 lab=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$lab/../../.." && pwd)
-for tool in docker containerlab jq python3 openssl flock; do command -v "$tool" >/dev/null; done
+for tool in docker containerlab jq python3 openssl flock; do
+    command -v "$tool" >/dev/null || { echo "ERROR: required tool not found: $tool" >&2; exit 1; }
+done
 # Keep the canonical host lock through deployment and the EXIT cleanup.
 host_lock=${RUSTBGPD_HOST_LOCK:-${HOME}/.local/state/rustbgpd-host.lock}
 mkdir -p "$(dirname "$host_lock")"
