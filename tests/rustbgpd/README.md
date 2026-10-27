@@ -1,11 +1,14 @@
 # rustbgpd action TLS tests
 
 Build with `-DBUILD_TESTS=ON -DENABLE_RUSTBGPD_SUPPORT=ON` and run
-`rustbgpd_action_tests`. The test build uses Bash and OpenSSL to generate fresh,
-two-day certificates in its build directory. The mock requires a trusted client
-certificate. Tests cover hostname verification, optional tokens, wrong CA,
-SAN mismatch, refusal to fall back to plaintext, partial TLS settings, and key
-file permissions, symlinks, FIFOs and size limits. Existing plaintext tests keep
+`rustbgpd_action_tests`. The test build uses Bash and OpenSSL to generate
+disposable certificates once in its build directory, and again only when
+`make-test-certificates.sh` changes. The mock requires a trusted client
+certificate. Tests cover hostname and IP address SAN verification, optional
+tokens, wrong CA, SAN mismatch, refusal to fall back to plaintext, hosts named
+like gRPC resolver schemes, reconnect backoff, partial TLS settings, key file
+permissions, symlinks, FIFOs and size limits, and CA and certificate file
+owner and write permissions. Existing plaintext tests keep
 covering the Unix socket and literal-loopback restrictions.
 
 ## M126 mTLS variant
