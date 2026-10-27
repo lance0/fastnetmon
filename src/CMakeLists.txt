@@ -1213,7 +1213,7 @@ if (BUILD_TESTS)
         # only when the script changes
         set(RUSTBGPD_TEST_CERT_DIR "${CMAKE_CURRENT_BINARY_DIR}/rustbgpd-test-certs")
         set(RUSTBGPD_TEST_CERT_SCRIPT "${PROJECT_SOURCE_DIR}/../tests/rustbgpd/make-test-certificates.sh")
-        set(RUSTBGPD_TEST_CERT_FILES ca.pem wrong-ca.pem server.key server.pem client.key client.pem)
+        set(RUSTBGPD_TEST_CERT_FILES ca.pem wrong-ca.pem server.key server.pem server-ip.key server-ip.pem client.key client.pem)
         list(TRANSFORM RUSTBGPD_TEST_CERT_FILES PREPEND "${RUSTBGPD_TEST_CERT_DIR}/")
         add_custom_command(OUTPUT ${RUSTBGPD_TEST_CERT_FILES}
             COMMAND bash "${RUSTBGPD_TEST_CERT_SCRIPT}" "${RUSTBGPD_TEST_CERT_DIR}"

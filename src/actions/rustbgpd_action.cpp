@@ -1042,6 +1042,7 @@ bool rustbgpd_read_community(const std::string& name, std::string& value) {
 }
 
 // Plaintext stays on Unix sockets or literal loopback; TLS also accepts DNS names and remote IP addresses.
+// TLS targets go to gRPC as dns:///host:port, so a host such as unix-abstract can never select another resolver
 bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, bool& unix_socket, bool tls) {
     unix_socket = false;
 
@@ -1080,7 +1081,7 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
             return false;
         }
 
-        grpc_target = "ipv6:[" + host + "]:";
+        grpc_target = (tls ? "dns:///[" : "ipv6:[") + host + "]:";
     } else {
         auto separator = target.rfind(':');
 
@@ -1103,7 +1104,7 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
             return false;
         }
 
-        grpc_target = "ipv4:" + host + ":";
+        grpc_target = (tls ? "dns:///" : "ipv4:") + host + ":";
     }
 
     if (port.empty() || port.size() > 5 || port.find_first_not_of("0123456789") != std::string::npos) {
@@ -1116,7 +1117,7 @@ bool rustbgpd_parse_target(const std::string& target, std::string& grpc_target, 
         return false;
     }
 
-    grpc_target = tls ? target : grpc_target + port;
+    grpc_target += port;
     return true;
 }
 

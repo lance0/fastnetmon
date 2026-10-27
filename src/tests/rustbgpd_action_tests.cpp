@@ -473,27 +473,30 @@ class RustbgpdActionTest : public ::testing::Test {
         configuration_map["rustbgpd_tls_key_file"] = write_file("client.key", tls_file("client.key"), 0600);
     }
 
-    void start_tcp_server(bool tls) {
+    // Replaces Unix socket server. Sets target to localhost and bound port, and tcp_port to that port
+    void start_tcp_server(bool tls, const std::string& address = "127.0.0.1:0", const std::string& certificate = "server") {
         server->Shutdown(std::chrono::system_clock::now() + 1s);
         grpc::ServerBuilder builder;
         std::shared_ptr<grpc::ServerCredentials> credentials;
+
         if (tls) {
             grpc::SslServerCredentialsOptions options;
             options.pem_root_certs = tls_file("ca.pem");
-            options.pem_key_cert_pairs.push_back({ tls_file("server.key"), tls_file("server.pem") });
+            options.pem_key_cert_pairs.push_back({ tls_file(certificate + ".key"), tls_file(certificate + ".pem") });
             options.client_certificate_request = GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
             credentials = grpc::SslServerCredentials(options);
         } else {
             credentials = grpc::InsecureServerCredentials();
         }
-        int port = 0;
-        builder.AddListeningPort("127.0.0.1:0", credentials, &port);
+
+        tcp_port = 0;
+        builder.AddListeningPort(address, credentials, &tcp_port);
         builder.RegisterService(injection.get());
         builder.RegisterService(control.get());
         server = builder.BuildAndStart();
         ASSERT_TRUE(server);
-        ASSERT_GT(port, 0);
-        configuration_map["rustbgpd_target"] = "localhost:" + std::to_string(port);
+        ASSERT_GT(tcp_port, 0);
+        configuration_map["rustbgpd_target"] = "localhost:" + std::to_string(tcp_port);
     }
 
     mock_state_t state;
@@ -502,6 +505,7 @@ class RustbgpdActionTest : public ::testing::Test {
     std::unique_ptr<grpc::Server> server;
     std::string directory;
     std::string socket_path;
+    int tcp_port = 0;
 };
 
 TEST_F(RustbgpdActionTest, announces_and_withdraws_host) {
@@ -1806,6 +1810,39 @@ TEST_F(RustbgpdActionTest, tls_key_file_checks) {
         rustbgpd_action_shutdown();
     }
     EXPECT_EQ(captured_log->text().find("PRIVATE KEY"), std::string::npos);
+}
+
+// Hosts named like gRPC resolver schemes must stay DNS names. Before TLS targets were passed as dns:///host:port,
+// this target reached the mock below through its abstract Unix socket
+TEST_F(RustbgpdActionTest, tls_host_named_like_resolver_scheme_is_dns_name) {
+    configure_tls();
+    std::string target = "unix-abstract:" + std::to_string(10000 + getpid() % 50000);
+    start_tcp_server(true, target);
+    configuration_map["rustbgpd_target"] = target;
+
+    ASSERT_TRUE(rustbgpd_action_init());
+    ipv4_action("ban", "203.0.113.7");
+    EXPECT_FALSE(wait_for([&] { return state.adds_started > 0; }, 4s)) << "target was used as resolver URI";
+    rustbgpd_action_shutdown();
+    EXPECT_FALSE(state.has("203.0.113.7/32"));
+    EXPECT_NE(captured_log->text().find("did not answer liveness probe"), std::string::npos);
+}
+
+// Literal address target is checked against IP address SAN of server certificate
+TEST_F(RustbgpdActionTest, tls_verifies_ip_address_san) {
+    for (const std::string host : { "127.0.0.1", "[::1]" }) {
+        SCOPED_TRACE(host);
+        configure_tls();
+        start_tcp_server(true, host + ":0", "server-ip");
+        configuration_map["rustbgpd_target"] = host + ":" + std::to_string(tcp_port);
+
+        ASSERT_TRUE(rustbgpd_action_init());
+        ipv4_action("ban", "203.0.113.7");
+        ASSERT_TRUE(wait_for([&] { return state.has("203.0.113.7/32"); }, 3s));
+        ipv4_action("unban", "203.0.113.7");
+        ASSERT_TRUE(wait_for([&] { return !state.has("203.0.113.7/32"); }, 3s));
+        rustbgpd_action_shutdown();
+    }
 }
 
 TEST_F(RustbgpdActionTest, tls_accepts_remote_targets_but_not_resolver_uris) {
