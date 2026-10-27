@@ -40,7 +40,7 @@ rustbgpd_community_host_ipv6 = 65535:666
 |---|---|---|
 | `rustbgpd` | `off` | Enable the action |
 | `rustbgpd_target` | `unix:///var/lib/rustbgpd/grpc.sock` | rustbgpd gRPC endpoint: `unix:///absolute/path`, or a literal loopback address and port: `127.0.0.1:50051` (any address in 127.0.0.0/8) or `[::1]:50051`. With mTLS, also accepts a host name or remote IP address and port |
-| `rustbgpd_token_file` | empty | File with the bearer token; sent as `authorization: Bearer <token>` on every call. Required for plaintext TCP; optional with mTLS. It must be a regular file (not a symbolic link) owned by the user who runs FastNetMon or by root, with no group or other permissions (`chmod 600`), at most 4096 bytes, one token of printable ASCII characters |
+| `rustbgpd_token_file` | empty | File with the bearer token; sent as `authorization: Bearer <token>` on every call. Required for plaintext TCP; with mTLS, required only when the rustbgpd listener sets `token_file`. It must be a regular file (not a symbolic link) owned by the user who runs FastNetMon or by root, with no group or other permissions (`chmod 600`), at most 4096 bytes, one token of printable ASCII characters |
 | `rustbgpd_tls_ca_file` | empty | PEM CA bundle used to verify the server certificate; set together with the client certificate and key. Same owner and no-symbolic-link requirements as the token file; must not be writable by group or others |
 | `rustbgpd_tls_cert_file` | empty | PEM client certificate chain; its principal must have the `operator` role in rustbgpd. Same file requirements as the CA file |
 | `rustbgpd_tls_key_file` | empty | PEM client private key; same owner, mode and no-symbolic-link requirements as the token file |
@@ -104,7 +104,9 @@ rustbgpd accepts plaintext gRPC only on its owner-only Unix socket or on a TCP l
   rustbgpd_tls_key_file = /etc/fastnetmon/client.key
   ```
 
-  Set all three TLS files or none. The client key must be owned by the user running FastNetMon or root, with no group or other permissions (`chmod 600`). The CA and certificate may be publicly readable. A bearer token is optional; when configured it is still sent on each call.
+  Set all three TLS files or none. All three must be owned by the user running FastNetMon or root. The client key must have no group or other permissions (`chmod 600`); the CA and certificate may be readable by anyone but writable only by their owner (`chmod 644`).
+
+  The bearer token is optional only when the rustbgpd listener has no `token_file`. If the listener sets `token_file`, rustbgpd checks the token in addition to the client certificate, so also set `rustbgpd_token_file`. When configured, the token is sent on each call. The role always comes from the certificate principal: the token only authenticates and never selects a role, and an mTLS listener cannot set `principal`.
 
   gRPC verifies the server certificate and target name. There is no name override, verification bypass, or plaintext fallback. Invalid certificates, an untrusted CA or a SAN mismatch prevent RPCs from reaching rustbgpd; the worker logs connection failures and retries with the same TLS credentials. Startup success alone does not prove a successful TLS handshake.
 
