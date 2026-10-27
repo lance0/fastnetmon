@@ -1966,7 +1966,8 @@ TEST_F(RustbgpdActionTest, token_file_checks) {
         { "group readable", write_file("group", "secret-token\n", 0640) },
         { "directory", directory },
         { "missing", directory + "/missing" },
-        { "empty", write_file("empty", "\n", 0600) },
+        { "empty", write_file("empty", "", 0600) },
+        { "only whitespace", write_file("blank", " \t\n", 0600) },
         { "too large", write_file("large", std::string(5000, 'a'), 0600) },
         { "space in token", write_file("space", "secret token\n", 0600) },
         { "fifo", fifo },
@@ -1991,6 +1992,14 @@ TEST_F(RustbgpdActionTest, token_file_checks) {
     }
 
     EXPECT_EQ(captured_log->text().find("secret"), std::string::npos) << "token content in log";
+}
+
+TEST_F(RustbgpdActionTest, whitespace_only_token_is_reported_as_empty) {
+    configuration_map["rustbgpd_token_file"] = write_file("blank", " \t\n", 0600);
+
+    EXPECT_FALSE(rustbgpd_action_init());
+    EXPECT_NE(captured_log->text().find("it is empty or contains only whitespace"), std::string::npos);
+    EXPECT_EQ(captured_log->text().find("printable ASCII"), std::string::npos);
 }
 
 TEST(rustbgpd_token_file_metadata, owner_and_mode) {

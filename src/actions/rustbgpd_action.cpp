@@ -1205,9 +1205,17 @@ bool rustbgpd_read_token_file(const std::string& path, std::string& token) {
     }
 
     boost::algorithm::trim(token);
-    if (token.empty() || std::any_of(token.begin(), token.end(), [](char c) { return c < 0x21 || c > 0x7e; })) {
-        logger << log4cpp::Priority::ERROR << "Cannot use rustbgpd_token_file " << path
-               << ": token must consist of printable ASCII characters without spaces";
+    std::string error;
+
+    if (token.empty()) {
+        error = "it is empty or contains only whitespace";
+    } else if (std::any_of(token.begin(), token.end(), [](char c) { return c < 0x21 || c > 0x7e; })) {
+        // Token goes to HTTP/2 header
+        error = "token must consist of printable ASCII characters without spaces";
+    }
+
+    if (!error.empty()) {
+        logger << log4cpp::Priority::ERROR << "Cannot use rustbgpd_token_file " << path << ": " << error;
         token.clear();
         return false;
     }
