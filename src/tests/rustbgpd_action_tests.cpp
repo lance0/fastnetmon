@@ -1873,6 +1873,22 @@ TEST_F(RustbgpdActionTest, tls_verifies_ip_address_san) {
     }
 }
 
+// Remote rustbgpd which closes every connection must not get a TLS attempt each 250 ms
+TEST_F(RustbgpdActionTest, tls_reconnect_backoff_grows) {
+    configure_tls();
+    connection_counter_t closing_server;
+    configuration_map["rustbgpd_target"] = "127.0.0.1:" + std::to_string(closing_server.port);
+
+    ASSERT_TRUE(rustbgpd_action_init());
+    ipv4_action("ban", "203.0.113.7");
+    std::this_thread::sleep_for(6s);
+    rustbgpd_action_shutdown();
+
+    // 250 ms maximum makes about 24 attempts in 6 seconds, 5 seconds maximum about 7
+    EXPECT_GE(closing_server.connections, 2);
+    EXPECT_LE(closing_server.connections, 12);
+}
+
 TEST_F(RustbgpdActionTest, tls_accepts_remote_targets_but_not_resolver_uris) {
     configure_tls();
     for (const std::string target : { "announcer.example:50051", "192.0.2.1:443", "[2001:db8::1]:50051" }) {

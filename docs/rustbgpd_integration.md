@@ -108,7 +108,7 @@ rustbgpd accepts plaintext gRPC only on its owner-only Unix socket or on a TCP l
 
   The bearer token is optional only when the rustbgpd listener has no `token_file`. If the listener sets `token_file`, rustbgpd checks the token in addition to the client certificate, so also set `rustbgpd_token_file`. When configured, the token is sent on each call. The role always comes from the certificate principal: the token only authenticates and never selects a role, and an mTLS listener cannot set `principal`.
 
-  gRPC verifies the server certificate and target name. There is no name override, verification bypass, or plaintext fallback. Invalid certificates, an untrusted CA or a SAN mismatch prevent RPCs from reaching rustbgpd; the worker logs connection failures and retries with the same TLS credentials. Startup success alone does not prove a successful TLS handshake.
+  gRPC verifies the server certificate and target name. There is no name override, verification bypass, or plaintext fallback. Invalid certificates, an untrusted CA or a SAN mismatch prevent RPCs from reaching rustbgpd; the worker logs connection failures and retries with the same TLS credentials, waiting up to about 5 seconds between attempts. Startup success alone does not prove a successful TLS handshake.
 
   rustbgpd derives the client principal from its `rustbgpd:` URI SAN, then email SAN, then Subject CN. Map the exact resulting value to `operator`; an unmapped principal can complete TLS but receives `PERMISSION_DENIED` on RPCs. Several collectors can use separately issued client certificates and role mappings. The [mTLS lab](../tests/rustbgpd/README.md) exercises IPv4 and IPv6 bans and withdrawals against a separate rustbgpd container and FRR.
 

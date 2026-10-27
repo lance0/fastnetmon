@@ -1323,7 +1323,12 @@ bool rustbgpd_action_init() {
     }
 
     // Reconnect quickly after rustbgpd restart. Default reconnect backoff grows up to 120 seconds
-    // Retrying connection to absent Unix socket or closed loopback port is cheap
+    // Without TLS we connect only to Unix socket or loopback, and retrying absent socket or closed port is cheap
+    // With TLS rustbgpd may be on another host, and several FastNetMon instances may share it. Each attempt there
+    // costs network round trips and a TLS handshake with public key operations on both sides, and a bad certificate
+    // or name fails the same way on every attempt. So we let backoff grow from 250 ms to 5 seconds (gRPC adds 20%
+    // jitter): about 12 attempts per minute per collector while rustbgpd is unreachable instead of 240, and bans
+    // still resume within about 6 seconds after it is back
     // We keep default minimum connect timeout (GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 20 seconds) as it also limits time
     // for HTTP/2 handshake
     // gRPC sends even literal addresses through proxy from grpc_proxy, https_proxy or http_proxy. Our channel
@@ -1331,7 +1336,7 @@ bool rustbgpd_action_init() {
     channel_arguments.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
 
     channel_arguments.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 250);
-    channel_arguments.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 250);
+    channel_arguments.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, tls ? 5000 : 250);
 
     // Worker and threads gRPC starts for our channel inherit our signal mask. With SIGINT blocked FastNetMon's
     // shutdown handler never runs on them. We do not block other signals: synchronous faults as SIGSEGV must reach
